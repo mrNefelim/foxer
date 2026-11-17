@@ -1,5 +1,6 @@
 use crate::{model::Strategy, trading::*};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 /// Rules that create plans and may be listed in policies.plans.disabled_rules.
@@ -389,6 +390,44 @@ impl Engine {
     }
     pub fn signals(&self) -> Vec<Signal> {
         self.signals.clone()
+    }
+    /// Current conditions for plans that still wait for confirmation or entry.
+    pub fn waiting_conditions(&self, c: &Strategy) -> Vec<Value> {
+        self.plans
+            .iter()
+            .filter_map(|plan| {
+                let status = match plan.state {
+                    PlanState::WaitConfirm => "wait_confirm",
+                    PlanState::WaitEntry | PlanState::Ready => "wait_entry",
+                    _ => return None,
+                };
+                Some(json!({
+                    "id": plan.id,
+                    "rule": plan.rule,
+                    "kind": plan.kind,
+                    "side": plan.side,
+                    "status": status,
+                    "poi_timeframe": plan.poi_tf,
+                    "poi": plan.poi,
+                    "entry_zone": plan.entry_zone,
+                    "confirmation_window_h4": if status == "wait_confirm" {
+                        Some(c.parameters.confirmation_inversion_h4_bars.value)
+                    } else {
+                        None
+                    },
+                    "confirmation_rule": if status == "wait_confirm" {
+                        Some("same_side_fvg_or_recent_opposite_zone_inversion")
+                    } else {
+                        None
+                    },
+                    "rr_min": c.parameters.rr_min.value,
+                    "stop_buffer_atr": c.parameters.stop_buffer_atr.value,
+                    "entry_session_filter": c.policies.trade_window.session_filter,
+                    "entry_h4_close_hours": c.policies.trade_window.entry_h4_close_hours,
+                    "started": plan.started
+                }))
+            })
+            .collect()
     }
     /// Plan rule enabled unless listed in policies.plans.disabled_rules.
     fn plan_enabled(c: &Strategy, rule: &str) -> bool {

@@ -185,7 +185,7 @@
       ],
       "entry_priority": "latest_new_fvg",
       "stop": "latest_protective_fractal_or_window_extreme",
-      "comment": "ID правил обозначают фиксированные алгоритмы. D_point_A и D_trend_weakness отключены в modules.",
+      "comment": "ID правил обозначают фиксированные алгоритмы. disabled_rules — необязательный список, по умолчанию []. D_point_A и D_trend_weakness отключены в modules.",
       "disabled_rules": []
     },
     "execution": {

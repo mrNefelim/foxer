@@ -336,7 +336,7 @@ pub fn swing_warmup(
 /// Connects the swing rules file to the runtime, one instrument at a time.
 fn connect_swing(runtime: &mut Runtime, c: &Settings) -> Result<(), String> {
     let Some(path) = &c.swing_strategy else {
-        return Ok(());
+        return runtime.reconcile_swing(&std::collections::BTreeSet::new());
     };
     let file: Value =
         serde_json::from_slice(&std::fs::read(path).map_err(|_| "cannot read swing rules file")?)
@@ -350,7 +350,8 @@ fn connect_swing(runtime: &mut Runtime, c: &Settings) -> Result<(), String> {
         })?;
         println!("{symbol}: swing rules connected");
     }
-    Ok(())
+    let configured = instruments.keys().cloned().collect();
+    runtime.reconcile_swing(&configured)
 }
 pub fn run(path: &Path) -> Result<String, String> {
     let c = Settings::load(path)?;
@@ -524,10 +525,186 @@ pub fn run(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::Runtime;
+    use forex_core::swing::{Kind, Swing, SwingConfig, Tf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::{
         io::{Read, Write},
         net::TcpListener,
     };
+    static SWING_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn swing_db() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "swing-disable-{}-{}.sqlite",
+            std::process::id(),
+            SWING_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn swing_rules() -> Value {
+        serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap()
+    }
+
+    fn swing_config() -> Value {
+        serde_json::from_str::<Value>(include_str!("../../strategy/swing-rules.json")).unwrap()
+            ["instruments"]["EURUSD"]
+            .clone()
+    }
+
+    fn prepared_swing() -> Swing {
+        let mut swing = Swing::new(serde_json::from_value::<SwingConfig>(swing_config()).unwrap());
+        swing.add_plan(Kind::Trend, 1, (1.0, 1.05), 1.2, Tf::H4);
+        swing
+    }
+
+    fn swing_tick(at: &str, price: f64) -> Tick {
+        Tick {
+            symbol: "EURUSD".into(),
+            millis: chrono::DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .timestamp_millis(),
+            price: (price * 1_000_000.0).round() as i64,
+            source: "upscale:index".into(),
+        }
+    }
+
+    fn seed_main_stop(runtime: &mut Runtime) {
+        let mut engine = Engine::default();
+        let mut snapshot = serde_json::to_value(&engine).unwrap();
+        snapshot["signals"] = json!([{
+            "id": "main-test",
+            "side": "Long",
+            "entry": 1_100_000,
+            "stop": 1_090_000,
+            "target": 1_200_000,
+            "take_profit": 1_200_000,
+            "state": "Active",
+            "last_quote_time": 0
+        }]);
+        engine = serde_json::from_value(snapshot).unwrap();
+        runtime.seed_instrument("EURUSD", engine).unwrap();
+    }
+
+    fn gap_ticks(runtime: &mut Runtime) {
+        for (at, price) in [
+            ("2026-01-05T10:00:00Z", 1.10000),
+            ("2026-01-05T10:30:00Z", 1.10100),
+            ("2026-01-05T11:00:00Z", 1.09900),
+            ("2026-01-05T13:59:00Z", 1.10050),
+            ("2026-01-05T14:00:00Z", 1.10050),
+            ("2026-01-05T15:00:00Z", 1.10300),
+            ("2026-01-05T17:59:00Z", 1.10280),
+            ("2026-01-05T18:00:00Z", 1.10280),
+            ("2026-01-05T19:00:00Z", 1.10300),
+            ("2026-01-05T21:59:00Z", 1.10250),
+            ("2026-01-05T22:00:00Z", 1.10250),
+        ] {
+            runtime.tick(swing_tick(at, price), true).unwrap();
+        }
+    }
+
+    fn settings(path: &std::path::Path, swing_strategy: Option<std::path::PathBuf>) -> Settings {
+        Settings {
+            chat: -1,
+            model: "test".into(),
+            telegram_token: "test".into(),
+            openai_key: "test".into(),
+            upscale_key: None,
+            max_tokens: 100,
+            database: path.into(),
+            strategy: "strategy/fvg-bot-rules.json".into(),
+            stale_seconds: 60,
+            swing_strategy,
+        }
+    }
+
+    #[test]
+    fn removing_swing_setting_restores_main_publication_and_tracks_old_position() {
+        let path = swing_db();
+        {
+            let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
+            seed_main_stop(&mut runtime);
+            runtime
+                .swing("EURUSD", swing_config(), || Ok(prepared_swing()))
+                .unwrap();
+            gap_ticks(&mut runtime);
+        }
+
+        // Emulate a persisted v4 snapshot written before the tracking-only flag existed.
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE entities SET payload=json_remove(payload, '$.markets.EURUSD.swing.enabled') WHERE kind='runtime' AND key='coordinator'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
+        let before = runtime.swing_rules("EURUSD").unwrap().trades()[0].clone();
+        connect_swing(&mut runtime, &settings(&path, None)).unwrap();
+        let restored = &runtime.swing_rules("EURUSD").unwrap().trades()[0];
+        assert_eq!(restored.state, forex_core::swing::TradeState::Active);
+        assert_eq!(restored.state, before.state);
+        assert_eq!(
+            (restored.entry, restored.stop, restored.tp),
+            (before.entry, before.stop, before.tp)
+        );
+
+        runtime
+            .tick(swing_tick("2026-01-05T22:30:00Z", 1.09000), true)
+            .unwrap();
+        let texts: Vec<_> = runtime
+            .pending()
+            .unwrap()
+            .into_iter()
+            .map(|out| out.payload["text"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(
+            texts.iter().any(|text| text.contains("Состояние Stop")),
+            "the main engine must publish again after swing is disabled: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("Стоп")),
+            "the old swing trade must still be tracked: {texts:?}"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn removed_swing_rules_do_not_publish_waiting_plans() {
+        for remove_setting in [true, false] {
+            let path = swing_db();
+            let mut file_path = None;
+            {
+                let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
+                runtime
+                    .swing("EURUSD", swing_config(), || Ok(prepared_swing()))
+                    .unwrap();
+            }
+            let setting = if remove_setting {
+                None
+            } else {
+                let file = path.with_extension("swing.json");
+                std::fs::write(&file, r#"{"instruments":{}}"#).unwrap();
+                file_path = Some(file.clone());
+                Some(file)
+            };
+            let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
+            connect_swing(&mut runtime, &settings(&path, setting)).unwrap();
+            let before = runtime.pending().unwrap().len();
+            gap_ticks(&mut runtime);
+            assert_eq!(
+                runtime.pending().unwrap().len(),
+                before,
+                "removed swing rules must not publish a waiting plan"
+            );
+            std::fs::remove_file(path).ok();
+            if let Some(file) = file_path {
+                std::fs::remove_file(file).ok();
+            }
+        }
+    }
     #[test]
     fn scheduled_pause_worker_emits_only_status_until_fresh_resume() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

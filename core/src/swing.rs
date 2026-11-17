@@ -490,6 +490,12 @@ pub enum TradeState {
     Cancelled,
     ReferenceExit,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    Market,
+    Limit,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Trade {
     pub kind: Kind,
@@ -500,6 +506,9 @@ pub struct Trade {
     pub rr: f64,
     pub signal_t: i64,
     pub fill_t: Option<i64>,
+    /// `None` is accepted only for snapshots written before order type was stored.
+    #[serde(default)]
+    pub entry_kind: Option<EntryKind>,
     pub state: TradeState,
     pub r: Option<f64>,
     pub exit_t: Option<i64>,
@@ -555,6 +564,8 @@ pub fn size_entry(dir: i8, close: f64, stop: f64, target: f64, c: &SwingConfig) 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Swing {
     cfg: SwingConfig,
+    #[serde(default = "default_true")]
+    allow_new_plans: bool,
     w: Frame,
     d: Frame,
     h4: Frame,
@@ -568,11 +579,15 @@ pub struct Swing {
     last_impulse: Option<i64>,
     events: Vec<(i64, Event, i8)>,
 }
+fn default_true() -> bool {
+    true
+}
 impl Swing {
     pub fn new(cfg: SwingConfig) -> Self {
         let n = cfg.atr_period;
         Self {
             cfg,
+            allow_new_plans: true,
             w: Frame::new(n),
             d: Frame::new(n),
             h4: Frame::new(n),
@@ -588,6 +603,29 @@ impl Swing {
     }
     pub fn trades(&self) -> &[Trade] {
         &self.trades
+    }
+    /// Fill order type for snapshots created before it was stored explicitly.
+    pub fn normalize_legacy_entry_kinds(&mut self) {
+        for trade in &mut self.trades {
+            if trade.entry_kind.is_none() && trade.state == TradeState::Pending {
+                trade.entry_kind = Some(EntryKind::Limit);
+            }
+        }
+    }
+    /// Stop creating plans while keeping existing Pending/Active trades manageable.
+    pub fn stop_new_plans(&mut self) {
+        self.allow_new_plans = false;
+        let open_plans: std::collections::BTreeSet<u64> = self
+            .trades
+            .iter()
+            .filter(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
+            .filter_map(|trade| trade.plan)
+            .collect();
+        self.plans.retain(|plan| open_plans.contains(&plan.id));
+    }
+    /// Resume plan creation after this swing configuration is selected again.
+    pub fn resume_new_plans(&mut self) {
+        self.allow_new_plans = true;
     }
     /// Events recorded so far: (time, event, direction).
     pub fn events(&self) -> &[(i64, Event, i8)] {
@@ -613,6 +651,9 @@ impl Swing {
         target: f64,
         conf_tf: Tf,
     ) -> bool {
+        if !self.allow_new_plans {
+            return false;
+        }
         if self
             .plans
             .iter()
@@ -694,11 +735,14 @@ impl Swing {
         if tf == Tf::D {
             self.d_count += 1;
         }
-        if tf == Tf::W {
-            self.weekly_plans(&b);
-        }
-        if tf == Tf::H4 && self.cfg.range.enabled && self.h4.len() > self.cfg.range.min_h4_bars {
-            self.range_step(&b);
+        if self.allow_new_plans {
+            if tf == Tf::W {
+                self.weekly_plans(&b);
+            }
+            if tf == Tf::H4 && self.cfg.range.enabled && self.h4.len() > self.cfg.range.min_h4_bars
+            {
+                self.range_step(&b);
+            }
         }
         for k in 0..self.plans.len() {
             self.advance(k, tf, &b);
@@ -746,9 +790,18 @@ impl Swing {
         if p.state == PlanState::Done {
             return;
         }
-        if self.d_count as i64 - p.created_day as i64 > self.cfg.plan_days as i64
-            && p.state != PlanState::Active
+        let trade_is_active = self
+            .trades
+            .iter()
+            .any(|trade| trade.plan == Some(p.id) && trade.state == TradeState::Active);
+        if self.d_count as i64 - p.created_day as i64 >= self.cfg.plan_days as i64
+            && !trade_is_active
         {
+            for trade in &mut self.trades {
+                if trade.plan == Some(p.id) && trade.state == TradeState::Pending {
+                    trade.state = TradeState::Cancelled;
+                }
+            }
             self.plans[k].state = PlanState::Done;
             return;
         }
@@ -816,6 +869,11 @@ impl Swing {
             rr: sizing.rr,
             signal_t: b.end,
             fill_t: market.then_some(b.end),
+            entry_kind: Some(if market {
+                EntryKind::Market
+            } else {
+                EntryKind::Limit
+            }),
             state: if market {
                 TradeState::Active
             } else {
@@ -999,6 +1057,11 @@ impl Swing {
                 rr: if limit { rr_fixed } else { rr_target },
                 signal_t: b.end,
                 fill_t: (!limit).then_some(b.end),
+                entry_kind: Some(if limit {
+                    EntryKind::Limit
+                } else {
+                    EntryKind::Market
+                }),
                 state: if limit {
                     TradeState::Pending
                 } else {

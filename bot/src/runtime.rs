@@ -48,8 +48,13 @@ struct Market {
 struct SwingMarket {
     config: Value,
     rules: Swing,
+    #[serde(default = "default_true")]
+    enabled: bool,
     /// Last published event per open trade.
     published: BTreeMap<String, String>,
+}
+fn default_true() -> bool {
+    true
 }
 fn swing_id(symbol: &str, t: &SwingTrade) -> String {
     let kind = match t.kind {
@@ -62,10 +67,13 @@ fn swing_id(symbol: &str, t: &SwingTrade) -> String {
 fn swing_event(t: &SwingTrade, previous: Option<&str>) -> &'static str {
     match t.state {
         TradeState::Pending => "Лимитная заявка",
-        TradeState::Active if previous == Some("Лимитная заявка") => {
+        TradeState::Active
+            if t.entry_kind == Some(crate::swing::EntryKind::Limit)
+                || previous == Some("Лимитная заявка")
+                || (t.entry_kind.is_none() && t.fill_t.is_some_and(|f| f != t.signal_t)) =>
+        {
             "Заявка исполнена"
         }
-        TradeState::Active if t.fill_t.is_some_and(|f| f != t.signal_t) => "Заявка исполнена",
         TradeState::Active => "Сделка открыта",
         TradeState::Stop => "Стоп",
         TradeState::Target => "Тейк",
@@ -87,10 +95,15 @@ pub fn swing_text(symbol: &str, t: &SwingTrade, event: &str, time: Option<i64>) 
     };
     let digits = if symbol.ends_with("JPY") { 3 } else { 5 };
     let p = |v: f64| format!("{v:.digits$}");
-    let order = if t.fill_t == Some(t.signal_t) {
-        "по рынку"
-    } else {
-        "лимит"
+    let order = match t.entry_kind {
+        Some(crate::swing::EntryKind::Limit) => "лимит",
+        Some(crate::swing::EntryKind::Market) => "по рынку",
+        None if t.state == TradeState::Pending
+            || t.fill_t.is_some_and(|fill| fill != t.signal_t) =>
+        {
+            "лимит"
+        }
+        None => "по рынку",
     };
     let when = time
         .and_then(|time| chrono::DateTime::from_timestamp(time, 0))
@@ -156,6 +169,69 @@ pub fn signal_text(s: &Signal) -> Result<String, String> {
         .map(|t| t.to_rfc3339())
         .unwrap_or_default();
     Ok(format!("{pair} · {side}\n{when}\nВход {} · стоп {} · цель {} · RR {rr:.2}\nСостояние {:?}\nПравило {}",p(s.entry),p(s.stop),p(s.take_profit),s.state,s.id.split(':').find(|part| !crate::valid_symbol(part)).unwrap_or("")))
+}
+fn waiting_condition_text(symbol: &str, condition: &Value) -> String {
+    let id = condition["id"].as_str().unwrap_or("unknown-plan");
+    let rule = condition["rule"].as_str().unwrap_or("plan");
+    let status = match condition["status"].as_str() {
+        Some("wait_confirm") => "ожидает подтверждения",
+        Some("wait_entry") => "ожидает новую входную зону H4",
+        _ => "ожидание пересчитано",
+    };
+    let poi_tf = condition["poi_timeframe"].as_str().unwrap_or("?");
+    let side = match condition["side"].as_str() {
+        Some("Long") => "покупка",
+        Some("Short") => "продажа",
+        _ => "неизвестное направление",
+    };
+    let low = condition["poi"]["low"].as_i64().unwrap_or_default();
+    let high = condition["poi"]["high"].as_i64().unwrap_or_default();
+    let price = |n: i64| format!("{}.{:06}", n / 1_000_000, n % 1_000_000);
+    let started = condition["started"]
+        .as_i64()
+        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "неизвестно".into());
+    let mut text = format!(
+        "Условия плана {id} после изменения правил\n{symbol} · {side} · {rule}\nСостояние: {status}\nPOI {poi_tf}: {}–{}\nПлан начат: {started}",
+        price(low),
+        price(high)
+    )
+    ;
+    if condition["status"] == "wait_confirm" {
+        let window = condition["confirmation_window_h4"]
+            .as_u64()
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "\nПодтверждение: FVG по направлению плана либо инверсия встречной зоны; окно инверсии — {window} H4"
+        ));
+    } else {
+        if let Some(zone) = condition["entry_zone"].as_object() {
+            let low = zone.get("low").and_then(Value::as_i64).unwrap_or_default();
+            let high = zone.get("high").and_then(Value::as_i64).unwrap_or_default();
+            text.push_str(&format!(
+                "\nВходная зона H4: {}–{}",
+                price(low),
+                price(high)
+            ));
+        } else {
+            text.push_str("\nВходная зона H4: ожидается");
+        }
+        let rr_min = condition["rr_min"].as_f64().unwrap_or_default();
+        let stop_buffer = condition["stop_buffer_atr"].as_f64().unwrap_or_default();
+        text.push_str(&format!(
+            "\nУсловия входа: RR min {rr_min}; запас стопа {stop_buffer} ATR"
+        ));
+        if condition["entry_session_filter"].as_bool() == Some(true) {
+            text.push_str(&format!(
+                "; часы закрытия H4 {:?}",
+                condition["entry_h4_close_hours"]
+            ));
+        } else {
+            text.push_str("; фильтр часов закрытия H4 выключен");
+        }
+    }
+    text
 }
 impl Runtime {
     pub fn started(&mut self, time: i64) -> Result<(), String> {
@@ -241,6 +317,11 @@ impl Runtime {
                 usage: Value::Null,
             }
         };
+        for market in s.markets.values_mut() {
+            if let Some(swing) = market.swing.as_mut() {
+                swing.rules.normalize_legacy_entry_kinds();
+            }
+        }
         if s.hash_version > 2 {
             return Err("unsupported runtime hash version".into());
         }
@@ -486,6 +567,15 @@ impl Runtime {
                         out.payload["symbol"]=json!(item.symbol);
                         messages.push(out);
                     }
+                    for condition in m.engine.waiting_conditions(&c) {
+                        let id = condition["id"].as_str().ok_or("waiting plan has no ID")?;
+                        messages.push(message(
+                            format!("conditions:{}:{}:{id}", comment.update_id, item.symbol),
+                            waiting_condition_text(&item.symbol, &condition),
+                            Some(&comment.signal_id),
+                            Some(comment.message_id),
+                        ));
+                    }
                 }
                 }
                 let file=self.rules_path.as_ref().ok_or("rules file is required for changes")?;
@@ -646,24 +736,48 @@ impl Runtime {
                 let key = swing_id(&symbol, tr);
                 let previous = sw.published.get(&key).cloned();
                 let mut events = vec![];
-                if previous.is_none()
-                    && tr.state != TradeState::Pending
-                    && tr.state != TradeState::Active
+                if previous.is_none() {
+                    if tr.entry_kind == Some(crate::swing::EntryKind::Limit) {
+                        events.push("Лимитная заявка");
+                        if tr.fill_t.is_some() {
+                            events.push("Заявка исполнена");
+                        }
+                    } else if tr.state != TradeState::Pending {
+                        events.push("Сделка открыта");
+                    }
+                }
+                if previous.as_deref() == Some("Лимитная заявка")
+                    && tr.fill_t.is_some()
+                    && !matches!(tr.state, TradeState::Pending)
                 {
-                    events.push(if tr.fill_t == Some(tr.signal_t) {
-                        "Сделка открыта"
-                    } else {
-                        "Лимитная заявка"
-                    });
+                    events.push("Заявка исполнена");
                 }
                 let event = swing_event(tr, previous.as_deref());
-                if previous.as_deref() != Some(event) {
+                if previous.as_deref() != Some(event) && !events.contains(&event) {
                     events.push(event);
                 }
                 for event in events {
+                    let mut display_trade = tr.clone();
+                    if event == "Лимитная заявка"
+                        && tr.entry_kind == Some(crate::swing::EntryKind::Limit)
+                        && tr.fill_t.is_some()
+                    {
+                        let cost = sw.config["cost"]
+                            .as_f64()
+                            .ok_or("stored swing cost is invalid")?;
+                        display_trade.entry -= f64::from(tr.dir) * cost;
+                    }
+                    if matches!(
+                        event,
+                        "Лимитная заявка" | "Заявка исполнена" | "Сделка открыта"
+                    ) {
+                        display_trade.state = TradeState::Active;
+                        display_trade.r = None;
+                        display_trade.exit_t = None;
+                    }
                     messages.push(message(
                         format!("{id}:{key}:{event}"),
-                        swing_text(&symbol, tr, event, Some(t.millis / 1000)),
+                        swing_text(&symbol, &display_trade, event, Some(t.millis / 1000)),
                         Some(&key),
                         None,
                     ));
@@ -677,7 +791,7 @@ impl Runtime {
         }
         m.engine.namespace_signals(&symbol);
         for signal in m.engine.signals() {
-            if m.swing.is_some() {
+            if m.swing.as_ref().is_some_and(|sw| sw.enabled) {
                 break;
             }
             let previous = before.iter().find(|p| p.id == signal.id);
@@ -729,8 +843,23 @@ impl Runtime {
             .markets
             .get(symbol)
             .ok_or("swing rules for an unknown instrument")?;
-        if current.swing.as_ref().is_some_and(|sw| sw.config == config) {
+        let same_config = current.swing.as_ref().is_some_and(|sw| sw.config == config);
+        let enabled = current.swing.as_ref().is_some_and(|sw| sw.enabled);
+        if same_config && enabled {
             return Ok(());
+        }
+        if same_config {
+            let mut s = self.s.clone();
+            s.sequence = s.sequence.checked_add(1).ok_or("event sequence overflow")?;
+            let tag = format!("swing:resume:{symbol}:{}", s.sequence);
+            let sw = s
+                .markets
+                .get_mut(symbol)
+                .and_then(|market| market.swing.as_mut())
+                .ok_or("swing rules disappeared")?;
+            sw.enabled = true;
+            sw.rules.resume_new_plans();
+            return self.commit(&tag, json!({"symbol":symbol,"enabled":true}), s, vec![]);
         }
         let mut rules = warm()?;
         rules.drain_finished();
@@ -760,9 +889,45 @@ impl Runtime {
             .swing = Some(SwingMarket {
             config: config.clone(),
             rules,
+            enabled: true,
             published,
         });
         self.commit(&tag, json!({"symbol":symbol,"swing":config}), s, messages)
+    }
+    /// Reconcile attached swing rules with the current optional rules file.
+    /// Existing Pending/Active trades remain attached for monitoring.
+    pub fn reconcile_swing(
+        &mut self,
+        configured: &std::collections::BTreeSet<String>,
+    ) -> Result<(), String> {
+        let disabled: Vec<String> = self
+            .s
+            .markets
+            .iter()
+            .filter_map(|(symbol, market)| {
+                market
+                    .swing
+                    .as_ref()
+                    .filter(|swing| swing.enabled && !configured.contains(symbol))
+                    .map(|_| symbol.clone())
+            })
+            .collect();
+        if disabled.is_empty() {
+            return Ok(());
+        }
+        let mut s = self.s.clone();
+        s.sequence = s.sequence.checked_add(1).ok_or("event sequence overflow")?;
+        let tag = format!("swing:disable:{}", s.sequence);
+        for symbol in &disabled {
+            let swing = s
+                .markets
+                .get_mut(symbol)
+                .and_then(|market| market.swing.as_mut())
+                .ok_or("swing rules disappeared")?;
+            swing.enabled = false;
+            swing.rules.stop_new_plans();
+        }
+        self.commit(&tag, json!({"disabled_swing":disabled}), s, vec![])
     }
     pub fn swing_rules(&self, symbol: &str) -> Option<&Swing> {
         self.s

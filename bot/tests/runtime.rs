@@ -48,6 +48,303 @@ fn setup() -> (PathBuf, Runtime) {
     r.link(9, "signal-1").unwrap();
     (p, r)
 }
+
+#[test]
+fn rule_change_reports_waiting_conditions_with_plan_identity_and_lifetime() {
+    use forex_bot::{
+        engine::Timeframe,
+        trading::{Side, Zone, ZoneKind},
+    };
+
+    let p = path();
+    let file = p.with_extension("json");
+    std::fs::write(&file, rules().to_string()).unwrap();
+    let mut engine = Engine::default();
+    engine.add_plan(
+        "D_correction_end",
+        Side::Long,
+        Timeframe::D,
+        Zone::new(Side::Long, 1_000_000, 1_010_000, 1, ZoneKind::Fvg),
+        1_700_000_000,
+    );
+    let mut runtime = Runtime::open_file(&p, &file, engine).unwrap();
+    runtime.link(9, "unrelated-comment-signal").unwrap();
+    runtime.update(&update(1), -1).unwrap();
+    let initial = forex_bot::state::Store::open(&p)
+        .unwrap()
+        .entities(forex_bot::state::Kind::Runtime)
+        .unwrap()[0]
+        .value
+        .clone();
+    let before = &initial["markets"]["EURUSD"]["engine"]["plans"][0];
+    let plan_id = before["id"].as_str().unwrap().to_owned();
+    let started = before["started"].as_i64().unwrap();
+
+    runtime.analysis(1, &analysis(0.2), &json!({})).unwrap();
+    let out = runtime.pending().unwrap();
+    let texts: Vec<_> = out
+        .iter()
+        .map(|message| message.payload["text"].as_str().unwrap())
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("Условия плана") && text.contains(&plan_id)),
+        "the updated waiting conditions and plan ID must be reported: {texts:?}"
+    );
+    assert!(out
+        .iter()
+        .all(|message| message.payload.get("revision").is_none()));
+
+    let updated = forex_bot::state::Store::open(&p)
+        .unwrap()
+        .entities(forex_bot::state::Kind::Runtime)
+        .unwrap()[0]
+        .value
+        .clone();
+    let after = &updated["markets"]["EURUSD"]["engine"]["plans"][0];
+    assert_eq!(after["id"], plan_id);
+    assert_eq!(after["started"], started);
+    assert_eq!(after["state"], "WaitEntry");
+
+    drop(runtime);
+    let runtime = Runtime::open_file(&p, &file, Engine::default()).unwrap();
+    let repeated: Vec<_> = runtime.pending().unwrap();
+    assert_eq!(repeated.len(), out.len());
+    assert!(repeated
+        .iter()
+        .any(|message| message.payload["text"].as_str().unwrap().contains(&plan_id)));
+    std::fs::remove_file(p).ok();
+    std::fs::remove_file(file).ok();
+}
+
+#[test]
+fn repeated_rule_cycles_have_distinct_condition_notifications_after_delivery() {
+    use forex_bot::{
+        engine::Timeframe,
+        trading::{Side, Zone, ZoneKind},
+    };
+    use std::collections::BTreeSet;
+
+    let p = path();
+    let file = p.with_extension("json");
+    std::fs::write(&file, rules().to_string()).unwrap();
+    let mut engine = Engine::default();
+    engine.add_plan(
+        "D_correction_end",
+        Side::Long,
+        Timeframe::D,
+        Zone::new(Side::Long, 1_000_000, 1_010_000, 1, ZoneKind::Fvg),
+        1_700_000_000,
+    );
+    let mut runtime = Runtime::open_file(&p, &file, engine).unwrap();
+    runtime.link(9, "cycle-plan-signal").unwrap();
+    let plan_id = forex_bot::state::Store::open(&p)
+        .unwrap()
+        .entities(forex_bot::state::Kind::Runtime)
+        .unwrap()[0]
+        .value["markets"]["EURUSD"]["engine"]["plans"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut seen_condition_ids = BTreeSet::new();
+    for (update_id, value) in [(1, 0.2), (2, 0.1), (3, 0.2), (4, 0.1)] {
+        runtime.update(&update(update_id), -1).unwrap();
+        runtime
+            .analysis(update_id, &analysis(value), &json!({}))
+            .unwrap();
+        let condition = runtime
+            .pending()
+            .unwrap()
+            .into_iter()
+            .find(|message| {
+                message.payload["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Условия плана"))
+            })
+            .expect("each recalculation publishes waiting conditions");
+        assert!(condition.payload["text"]
+            .as_str()
+            .unwrap()
+            .contains(&plan_id));
+        assert!(
+            seen_condition_ids.insert(condition.id.clone()),
+            "duplicate event ID {}",
+            condition.id
+        );
+        runtime.delivered(&condition.id, 200 + update_id).unwrap();
+        drop(runtime);
+        runtime = Runtime::open_file(&p, &file, Engine::default()).unwrap();
+    }
+
+    assert_eq!(
+        runtime.rules()["parameters"]["stop_buffer_atr"]["value"],
+        0.1
+    );
+    let stored = forex_bot::state::Store::open(&p)
+        .unwrap()
+        .entities(forex_bot::state::Kind::Runtime)
+        .unwrap()[0]
+        .value
+        .clone();
+    assert!(stored["rules_hash"]
+        .as_str()
+        .is_some_and(|hash| !hash.is_empty()));
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&file).unwrap()).unwrap(),
+        runtime.rules()
+    );
+    assert!(runtime
+        .pending()
+        .unwrap()
+        .iter()
+        .all(|message| !message.payload["text"]
+            .as_str()
+            .unwrap()
+            .contains("Условия плана")));
+    std::fs::remove_file(p).ok();
+    std::fs::remove_file(file).ok();
+}
+
+#[test]
+fn wait_confirm_notification_describes_current_confirmation_window_and_direction() {
+    use forex_bot::{
+        engine::Timeframe,
+        trading::{Side, Zone, ZoneKind},
+    };
+
+    let p = path();
+    let file = p.with_extension("json");
+    std::fs::write(&file, rules().to_string()).unwrap();
+    let mut engine = Engine::default();
+    engine.add_plan(
+        "W_point_A",
+        Side::Long,
+        Timeframe::W,
+        Zone::new(Side::Long, 1_000_000, 1_010_000, 1, ZoneKind::Fvg),
+        1_700_000_000,
+    );
+    let mut runtime = Runtime::open_file(&p, &file, engine).unwrap();
+    runtime.link(9, "wait-confirm-signal").unwrap();
+    runtime.update(&update(1), -1).unwrap();
+    runtime
+        .analysis(
+            1,
+            &Analysis {
+                action: "apply".into(),
+                explanation: String::new(),
+                changes: vec![Change {
+                    path: "/parameters/confirmation_inversion_h4_bars/value".into(),
+                    value: json!(31),
+                }],
+            },
+            &json!({}),
+        )
+        .unwrap();
+    let message = runtime
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            message.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Условия плана"))
+        })
+        .expect("wait_confirm condition notification");
+    let text = message.payload["text"].as_str().unwrap();
+    assert!(text.contains("W_point_A"), "{text}");
+    assert!(text.to_lowercase().contains("покуп"), "{text}");
+    assert!(
+        text.contains("31 H4"),
+        "new confirmation window must be explicit: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("инверс"),
+        "confirmation rule must be explicit: {text}"
+    );
+    let stored = forex_bot::state::Store::open(&p)
+        .unwrap()
+        .entities(forex_bot::state::Kind::Runtime)
+        .unwrap()[0]
+        .value
+        .clone();
+    assert_eq!(
+        stored["markets"]["EURUSD"]["engine"]["plans"][0]["state"],
+        "WaitConfirm"
+    );
+    std::fs::remove_file(p).ok();
+    std::fs::remove_file(file).ok();
+}
+
+#[test]
+fn wait_entry_notification_describes_current_entry_conditions() {
+    use forex_bot::{
+        engine::Timeframe,
+        trading::{Side, Zone, ZoneKind},
+    };
+
+    let p = path();
+    let file = p.with_extension("json");
+    std::fs::write(&file, rules().to_string()).unwrap();
+    let mut engine = Engine::default();
+    engine.add_plan(
+        "D_correction_end",
+        Side::Short,
+        Timeframe::D,
+        Zone::new(Side::Short, 1_100_000, 1_110_000, 1, ZoneKind::Fvg),
+        1_700_000_000,
+    );
+    let mut runtime = Runtime::open_file(&p, &file, engine).unwrap();
+    runtime.link(9, "wait-entry-signal").unwrap();
+    runtime.update(&update(1), -1).unwrap();
+    runtime
+        .analysis(
+            1,
+            &Analysis {
+                action: "apply".into(),
+                explanation: String::new(),
+                changes: vec![
+                    Change {
+                        path: "/parameters/stop_buffer_atr/value".into(),
+                        value: json!(0.07),
+                    },
+                    Change {
+                        path: "/parameters/rr_min/value".into(),
+                        value: json!(2.2),
+                    },
+                ],
+            },
+            &json!({}),
+        )
+        .unwrap();
+    let message = runtime
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|message| {
+            message.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Условия плана"))
+        })
+        .expect("wait_entry condition notification");
+    let text = message.payload["text"].as_str().unwrap();
+    assert!(text.to_lowercase().contains("продаж"), "{text}");
+    assert!(
+        text.contains("2.2"),
+        "current rr_min must be stated: {text}"
+    );
+    assert!(
+        text.contains("0.07"),
+        "current stop buffer must be stated: {text}"
+    );
+    assert!(
+        text.to_lowercase().contains("входн"),
+        "current entry conditions must be stated: {text}"
+    );
+    std::fs::remove_file(p).ok();
+    std::fs::remove_file(file).ok();
+}
 #[test]
 fn comments_survive_restart_and_replay_and_only_head_can_apply() {
     let (p, mut r) = setup();

@@ -192,6 +192,50 @@ fn waiting_plan_expires_after_plan_days_daily_closes() {
 }
 
 #[test]
+fn pending_plan_expires_on_the_boundary_before_a_late_fill() {
+    let signal_t = 10 * 86_400 + 12 * 3600;
+    let mut s = Swing::new(SwingConfig {
+        plan_days: 2,
+        ..cfg()
+    });
+    s.add_plan(Kind::Trend, 1, (90.0, 95.0), 104.0, Tf::H4);
+    feed(&mut s, &bullish_gap(signal_t));
+    assert_eq!(s.trades()[0].state, TradeState::Pending);
+    let entry = s.trades()[0].entry;
+
+    let mut s: Swing = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
+    for day in 1..=2 {
+        let end = signal_t + day * 86_400;
+        s.close(Tf::D, bar(end, 100.0, 101.0, 99.0, 100.0), end);
+    }
+    s.minute(signal_t + 2 * 86_400 + 60, entry, entry);
+    assert_eq!(s.trades()[0].state, TradeState::Cancelled);
+    assert_eq!(
+        s.trades()[0].fill_t,
+        None,
+        "the boundary close precedes a later quote"
+    );
+}
+
+#[test]
+fn executed_trade_remains_active_after_plan_lifetime() {
+    let signal_t = 10 * 86_400 + 12 * 3600;
+    let mut s = Swing::new(SwingConfig {
+        plan_days: 2,
+        ..cfg()
+    });
+    s.add_plan(Kind::Trend, 1, (90.0, 95.0), 120.0, Tf::H4);
+    feed(&mut s, &bullish_gap(signal_t));
+    assert_eq!(s.trades()[0].state, TradeState::Active);
+
+    for day in 1..=3 {
+        let end = signal_t + day * 86_400;
+        s.close(Tf::D, bar(end, 100.0, 101.0, 99.0, 100.0), end);
+    }
+    assert_eq!(s.trades()[0].state, TradeState::Active);
+}
+
+#[test]
 fn nothing_is_planned_or_traded_before_start() {
     let end = 10 * 86_400 + 12 * 3600;
     let mut s = Swing::new(SwingConfig {
