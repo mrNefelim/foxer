@@ -52,6 +52,15 @@ struct SwingMarket {
     enabled: bool,
     /// Last published event per open trade.
     published: BTreeMap<String, String>,
+    /// Older configuration instances retained only while their published trades are open.
+    #[serde(default)]
+    retired: Vec<RetiredSwing>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+struct RetiredSwing {
+    config: Value,
+    rules: Swing,
+    published: BTreeMap<String, String>,
 }
 fn default_true() -> bool {
     true
@@ -61,6 +70,7 @@ fn swing_id(symbol: &str, t: &SwingTrade) -> String {
         SwingKind::Trend => "trend",
         SwingKind::Correction => "correction",
         SwingKind::Range => "range",
+        SwingKind::TrendPullback => "trend_pullback",
     };
     format!("{symbol}:swing:{kind}:{}:{}", t.dir, t.signal_t)
 }
@@ -81,7 +91,7 @@ fn swing_event(t: &SwingTrade, previous: Option<&str>) -> &'static str {
         TradeState::ReferenceExit => "Закрыта по индексу доллара",
     }
 }
-pub fn swing_text(symbol: &str, t: &SwingTrade, event: &str, time: Option<i64>) -> String {
+pub fn swing_text(symbol: &str, t: &SwingTrade, event: &str, quote_millis: Option<i64>) -> String {
     let pair = format!("{}/{}", &symbol[..3], &symbol[3..]);
     let side = if t.dir > 0 {
         "покупка"
@@ -92,6 +102,7 @@ pub fn swing_text(symbol: &str, t: &SwingTrade, event: &str, time: Option<i64>) 
         SwingKind::Trend => "тренд",
         SwingKind::Correction => "коррекция",
         SwingKind::Range => "боковик",
+        SwingKind::TrendPullback => "тренд pullback",
     };
     let digits = if symbol.ends_with("JPY") { 3 } else { 5 };
     let p = |v: f64| format!("{v:.digits$}");
@@ -105,8 +116,8 @@ pub fn swing_text(symbol: &str, t: &SwingTrade, event: &str, time: Option<i64>) 
         }
         None => "по рынку",
     };
-    let when = time
-        .and_then(|time| chrono::DateTime::from_timestamp(time, 0))
+    let when = quote_millis
+        .and_then(chrono::DateTime::from_timestamp_millis)
         .map(|t| format!("\n{}", t.to_rfc3339()))
         .unwrap_or_default();
     let rr = (t.tp - t.entry).abs() / (t.entry - t.stop).abs();
@@ -149,6 +160,101 @@ fn message(id: String, text: String, signal: Option<&str>, reply: Option<i64>) -
         id,
         payload: json!({"text":text,"signal_id":signal,"reply_to":reply}),
     }
+}
+struct SwingAdvanceContext<'a> {
+    tick: &'a Tick,
+    id: &'a str,
+    config: &'a Value,
+    bars: &'a [(crate::swing::Tf, crate::swing::Bar)],
+    external_open_positions: usize,
+    messages: &'a mut Vec<Outbound>,
+}
+fn advance_swing(
+    rules: &mut Swing,
+    published: &mut BTreeMap<String, String>,
+    context: SwingAdvanceContext<'_>,
+) -> Result<(), String> {
+    let SwingAdvanceContext {
+        tick,
+        id,
+        config,
+        bars,
+        external_open_positions,
+        messages,
+    } = context;
+    let symbol = tick.symbol.as_str();
+    let now = crate::swing::grid_time(tick.millis / 1000);
+    let price = tick.price as f64 / 1_000_000.0;
+    for (tf, bar) in bars {
+        rules.close_with_external_open_positions(*tf, *bar, now, external_open_positions);
+    }
+    rules.minute(now, price, price);
+    let mut trades = rules.drain_finished();
+    trades.extend(rules.trades().iter().cloned());
+    for trade in &trades {
+        let key = swing_id(symbol, trade);
+        let previous = published.get(&key).cloned();
+        let mut events = vec![];
+        if previous.is_none() {
+            if trade.entry_kind == Some(crate::swing::EntryKind::Limit) {
+                events.push("Лимитная заявка");
+                if trade.fill_t.is_some() {
+                    events.push("Заявка исполнена");
+                }
+            } else if trade.state != TradeState::Pending {
+                events.push("Сделка открыта");
+            }
+        }
+        if previous.as_deref() == Some("Лимитная заявка")
+            && trade.fill_t.is_some()
+            && !matches!(trade.state, TradeState::Pending)
+        {
+            events.push("Заявка исполнена");
+        }
+        let event = swing_event(trade, previous.as_deref());
+        if previous.as_deref() != Some(event) && !events.contains(&event) {
+            events.push(event);
+        }
+        for event in events {
+            let mut display_trade = trade.clone();
+            if event == "Лимитная заявка"
+                && trade.entry_kind == Some(crate::swing::EntryKind::Limit)
+                && trade.fill_t.is_some()
+            {
+                let cost = config["cost"]
+                    .as_f64()
+                    .ok_or("stored swing cost is invalid")?;
+                display_trade.entry -= f64::from(trade.dir) * cost;
+            }
+            if matches!(
+                event,
+                "Лимитная заявка" | "Заявка исполнена" | "Сделка открыта"
+            ) {
+                display_trade.state = TradeState::Active;
+                display_trade.r = None;
+                display_trade.exit_t = None;
+            }
+            messages.push(message(
+                format!("{id}:{key}:{event}"),
+                swing_text(symbol, &display_trade, event, Some(tick.millis)),
+                Some(&key),
+                None,
+            ));
+        }
+        if matches!(trade.state, TradeState::Pending | TradeState::Active) {
+            published.insert(key, event.to_owned());
+        } else {
+            published.remove(&key);
+        }
+    }
+    Ok(())
+}
+fn open_swing_positions(rules: &Swing) -> usize {
+    rules
+        .trades()
+        .iter()
+        .filter(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
+        .count()
 }
 pub fn signal_text(s: &Signal) -> Result<String, String> {
     let symbol =
@@ -724,70 +830,56 @@ impl Runtime {
             ));
         }
         if let Some(sw) = m.swing.as_mut() {
-            let now = crate::swing::grid_time(t.millis / 1000);
-            for (tf, bar) in crate::swing::rules_bars(&batch.all_bars) {
-                sw.rules.close(tf, bar, now);
+            let bars = crate::swing::rules_bars(&batch.all_bars);
+            // Snapshot occupancy before processing any exits in this tick. This
+            // makes admission conservative when a trade exits on the same minute.
+            let current_at_start = open_swing_positions(&sw.rules);
+            let retired_at_start: Vec<_> = sw
+                .retired
+                .iter()
+                .map(|retired| open_swing_positions(&retired.rules))
+                .collect();
+            let retired_total: usize = retired_at_start.iter().sum();
+            advance_swing(
+                &mut sw.rules,
+                &mut sw.published,
+                SwingAdvanceContext {
+                    tick: &t,
+                    id: &id,
+                    config: &sw.config,
+                    bars: &bars,
+                    external_open_positions: retired_total,
+                    messages: &mut messages,
+                },
+            )?;
+            let current_reserved = current_at_start.max(open_swing_positions(&sw.rules));
+            for (index, retired) in sw.retired.iter_mut().enumerate() {
+                let other_retired: usize = retired_at_start
+                    .iter()
+                    .enumerate()
+                    .filter(|(other_index, _)| *other_index != index)
+                    .map(|(_, count)| *count)
+                    .sum();
+                advance_swing(
+                    &mut retired.rules,
+                    &mut retired.published,
+                    SwingAdvanceContext {
+                        tick: &t,
+                        id: &id,
+                        config: &retired.config,
+                        bars: &bars,
+                        external_open_positions: current_reserved + other_retired,
+                        messages: &mut messages,
+                    },
+                )?;
             }
-            let price = t.price as f64 / 1_000_000.0;
-            sw.rules.minute(now, price, price);
-            let mut trades = sw.rules.drain_finished();
-            trades.extend(sw.rules.trades().iter().cloned());
-            for tr in &trades {
-                let key = swing_id(&symbol, tr);
-                let previous = sw.published.get(&key).cloned();
-                let mut events = vec![];
-                if previous.is_none() {
-                    if tr.entry_kind == Some(crate::swing::EntryKind::Limit) {
-                        events.push("Лимитная заявка");
-                        if tr.fill_t.is_some() {
-                            events.push("Заявка исполнена");
-                        }
-                    } else if tr.state != TradeState::Pending {
-                        events.push("Сделка открыта");
-                    }
-                }
-                if previous.as_deref() == Some("Лимитная заявка")
-                    && tr.fill_t.is_some()
-                    && !matches!(tr.state, TradeState::Pending)
-                {
-                    events.push("Заявка исполнена");
-                }
-                let event = swing_event(tr, previous.as_deref());
-                if previous.as_deref() != Some(event) && !events.contains(&event) {
-                    events.push(event);
-                }
-                for event in events {
-                    let mut display_trade = tr.clone();
-                    if event == "Лимитная заявка"
-                        && tr.entry_kind == Some(crate::swing::EntryKind::Limit)
-                        && tr.fill_t.is_some()
-                    {
-                        let cost = sw.config["cost"]
-                            .as_f64()
-                            .ok_or("stored swing cost is invalid")?;
-                        display_trade.entry -= f64::from(tr.dir) * cost;
-                    }
-                    if matches!(
-                        event,
-                        "Лимитная заявка" | "Заявка исполнена" | "Сделка открыта"
-                    ) {
-                        display_trade.state = TradeState::Active;
-                        display_trade.r = None;
-                        display_trade.exit_t = None;
-                    }
-                    messages.push(message(
-                        format!("{id}:{key}:{event}"),
-                        swing_text(&symbol, &display_trade, event, Some(t.millis / 1000)),
-                        Some(&key),
-                        None,
-                    ));
-                }
-                if matches!(tr.state, TradeState::Pending | TradeState::Active) {
-                    sw.published.insert(key, event.to_owned());
-                } else {
-                    sw.published.remove(&key);
-                }
-            }
+            sw.retired.retain(|retired| {
+                retired
+                    .rules
+                    .trades()
+                    .iter()
+                    .any(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
+            });
         }
         m.engine.namespace_signals(&symbol);
         for signal in m.engine.signals() {
@@ -835,6 +927,9 @@ impl Runtime {
     ) -> Result<(), String> {
         let parsed: SwingConfig = serde_json::from_value(config.clone())
             .map_err(|e| format!("invalid swing rules for {symbol}: {e}"))?;
+        parsed
+            .validate()
+            .map_err(|e| format!("invalid swing rules for {symbol}: {e}"))?;
         if parsed.reference_exit.is_some() {
             return Err("swing reference_exit is not available in the live bot".into());
         }
@@ -863,9 +958,67 @@ impl Runtime {
         }
         let mut rules = warm()?;
         rules.drain_finished();
+        // Delivered and still-pending outbox messages both prove that a stable
+        // swing signal ID was already published. Read pending rows without
+        // acknowledging or otherwise changing the delivery queue.
+        let mut registered_ids: std::collections::BTreeSet<String> =
+            self.s.known.values().cloned().collect();
+        registered_ids.extend(
+            self.store
+                .pending()?
+                .into_iter()
+                .filter_map(|out| out.payload["signal_id"].as_str().map(str::to_owned)),
+        );
         let mut s = self.s.clone();
         s.sequence += 1;
         let tag = format!("swing:{symbol}:{}:{}", hash(&config), s.sequence);
+        let market = s
+            .markets
+            .get_mut(symbol)
+            .ok_or("swing rules for an unknown instrument")?;
+        let mut retired = if let Some(mut old) = market.swing.take() {
+            let mut retired = old.retired;
+            if old
+                .rules
+                .trades()
+                .iter()
+                .any(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
+            {
+                old.rules.stop_new_plans();
+                retired.push(RetiredSwing {
+                    config: old.config,
+                    rules: old.rules,
+                    published: old.published,
+                });
+            }
+            retired
+        } else {
+            Vec::new()
+        };
+        // A full-history warm-up can rediscover the same still-open signal. Keep its
+        // original instance and do not publish/manage an identical second trade.
+        let mut already_managed: Vec<_> = retired
+            .iter()
+            .flat_map(|old| old.rules.trades())
+            .filter(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
+            .cloned()
+            .collect();
+        already_managed.extend(
+            rules
+                .trades()
+                .iter()
+                .filter(|trade| {
+                    matches!(trade.state, TradeState::Pending | TradeState::Active)
+                        && registered_ids.contains(&swing_id(symbol, trade))
+                })
+                .cloned(),
+        );
+        rules.remove_duplicate_open_trades(&already_managed);
+        let retired_open_positions: usize = retired
+            .iter()
+            .map(|old| open_swing_positions(&old.rules))
+            .sum();
+        rules.limit_warm_open_positions(retired_open_positions);
         let mut published = BTreeMap::new();
         let mut messages = vec![];
         for tr in rules.trades() {
@@ -883,14 +1036,12 @@ impl Runtime {
             ));
             published.insert(key, swing_event(tr, None).to_owned());
         }
-        s.markets
-            .get_mut(symbol)
-            .ok_or("swing rules for an unknown instrument")?
-            .swing = Some(SwingMarket {
+        market.swing = Some(SwingMarket {
             config: config.clone(),
             rules,
             enabled: true,
             published,
+            retired: std::mem::take(&mut retired),
         });
         self.commit(&tag, json!({"symbol":symbol,"swing":config}), s, messages)
     }

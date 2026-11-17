@@ -164,8 +164,11 @@ pub fn build(inputs: &[&Path], output: &Path) -> Result<(), String> {
     Ok(())
 }
 fn load_config(path: &Path) -> Result<SwingConfig, String> {
-    serde_json::from_slice(&std::fs::read(path).map_err(|_| "cannot read swing config")?)
-        .map_err(|e| format!("invalid swing config: {e}"))
+    let config: SwingConfig =
+        serde_json::from_slice(&std::fs::read(path).map_err(|_| "cannot read swing config")?)
+            .map_err(|e| format!("invalid swing config: {e}"))?;
+    config.validate()?;
+    Ok(config)
 }
 /// Runs the rule set over an index export and returns its events sorted by time.
 fn index_events(csv: &Path, config: &Path) -> Result<Vec<(i64, Event, i8)>, String> {
@@ -236,6 +239,7 @@ pub fn write_trades(swing: &Swing, output: &Path) -> Result<(), String> {
                 Kind::Trend => "trend",
                 Kind::Correction => "correction",
                 Kind::Range => "range",
+                Kind::TrendPullback => "trend_pullback",
             },
             t.dir,
             stamp(t.signal_t),

@@ -31,9 +31,10 @@ pub fn run(root: &Path, symbol: &str, config: &Path, output: &Path) -> Result<()
         .map(|(name, meta)| (root.join("prepared").join(name), meta.clone()))
         .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    let cfg =
+    let cfg: forex_core::swing::SwingConfig =
         serde_json::from_slice(&std::fs::read(config).map_err(|_| "cannot read swing config")?)
             .map_err(|e| format!("invalid swing config: {e}"))?;
+    cfg.validate()?;
     let mut swing = Swing::new(cfg);
     let mut aggregator = Aggregator::default();
     read_minutes(&files, i64::MIN, i64::MAX, |m| {

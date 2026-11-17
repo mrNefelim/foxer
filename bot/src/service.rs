@@ -298,6 +298,8 @@ pub fn swing_warmup(
 ) -> Result<crate::swing::Swing, String> {
     let cfg: crate::swing::SwingConfig = serde_json::from_value(config.clone())
         .map_err(|e| format!("invalid swing rules for {symbol}: {e}"))?;
+    cfg.validate()
+        .map_err(|e| format!("invalid swing rules for {symbol}: {e}"))?;
     let db = crate::data::open(database).map_err(|e| e.to_string())?;
     let mut sources = db
         .prepare("SELECT DISTINCT source FROM minutes WHERE symbol=?1")
@@ -547,8 +549,8 @@ mod tests {
     }
 
     fn swing_config() -> Value {
-        serde_json::from_str::<Value>(include_str!("../../strategy/swing-rules.json")).unwrap()
-            ["instruments"]["EURUSD"]
+        serde_json::from_str::<Value>(include_str!("../../tests/fixtures/swing-legacy-rules.json"))
+            .unwrap()["instruments"]["EURUSD"]
             .clone()
     }
 

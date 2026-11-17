@@ -152,11 +152,55 @@ impl Default for RangeConfig {
         }
     }
 }
+
+/// Signal-generation family selected independently for each instrument.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyFamily {
+    #[default]
+    LegacySwing,
+    TrendPullback,
+}
+
+/// Parameters that affect only trend-pullback signal generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrendPullbackConfig {
+    pub fast_ema_bars: usize,
+    pub slow_ema_bars: usize,
+    /// Optional per-instrument cap; absence preserves old unbounded snapshots.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_open_position_limit"
+    )]
+    pub max_open_positions: Option<usize>,
+}
+
+fn deserialize_open_position_limit<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let limit = usize::deserialize(deserializer)?;
+    if limit == 0 {
+        return Err(serde::de::Error::custom(
+            "trend_pullback.max_open_positions must be positive",
+        ));
+    }
+    Ok(Some(limit))
+}
+
 /// Swing rule parameters. Every field except `reference_exit` is required in JSON;
 /// `Default` exists only for building rules in code.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwingConfig {
+    /// Missing in legacy files and snapshots written before family selection existed.
+    #[serde(default)]
+    pub family: StrategyFamily,
+    /// Required exactly when family is `trend_pullback`.
+    #[serde(default)]
+    pub trend_pullback: Option<TrendPullbackConfig>,
     pub atr_period: usize,
     pub rr_fixed: f64,
     pub take_profit: TakeProfit,
@@ -178,6 +222,8 @@ pub struct SwingConfig {
 impl Default for SwingConfig {
     fn default() -> Self {
         Self {
+            family: StrategyFamily::LegacySwing,
+            trend_pullback: None,
             atr_period: 14,
             rr_fixed: 2.0,
             take_profit: TakeProfit::Fixed,
@@ -191,6 +237,43 @@ impl Default for SwingConfig {
             start: 0,
             range: RangeConfig::default(),
             reference_exit: None,
+        }
+    }
+}
+
+impl SwingConfig {
+    /// Validates family-specific parameters after backwards-compatible deserialization.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.cost.is_finite() || self.cost < 0.0 {
+            return Err("swing cost must be finite and nonnegative".into());
+        }
+        match (self.family, &self.trend_pullback) {
+            (StrategyFamily::LegacySwing, None) => Ok(()),
+            (StrategyFamily::LegacySwing, Some(_)) => {
+                Err("trend_pullback parameters require family trend_pullback".into())
+            }
+            (StrategyFamily::TrendPullback, None) => {
+                Err("family trend_pullback requires trend_pullback parameters".into())
+            }
+            (StrategyFamily::TrendPullback, Some(params)) => {
+                let fast_ok = [8, 12, 16, 20].contains(&params.fast_ema_bars);
+                let slow_ok = [32, 40, 50].contains(&params.slow_ema_bars);
+                if !fast_ok || !slow_ok || params.fast_ema_bars >= params.slow_ema_bars {
+                    return Err("trend_pullback EMA periods are unsupported".into());
+                }
+                if params.max_open_positions == Some(0) {
+                    return Err("trend_pullback.max_open_positions must be positive".into());
+                }
+                if self.atr_period != 14
+                    || self.stop_lookback_h4_bars != 10
+                    || (self.stop_buffer_atr - 0.1).abs() > f64::EPSILON
+                    || (self.rr_fixed - 2.0).abs() > f64::EPSILON
+                    || self.take_profit != TakeProfit::Fixed
+                {
+                    return Err("trend_pullback shared execution parameters are unsupported".into());
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -447,6 +530,7 @@ pub enum Kind {
     Trend,
     Correction,
     Range,
+    TrendPullback,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RangeBox {
@@ -561,6 +645,55 @@ pub fn size_entry(dir: i8, close: f64, stop: f64, target: f64, c: &SwingConfig) 
     })
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct EmaState {
+    count: usize,
+    seed_sum: f64,
+    #[serde(default)]
+    seed_mean: Option<f64>,
+    value: Option<f64>,
+}
+impl EmaState {
+    fn update(&mut self, close: f64, period: usize) -> Option<f64> {
+        if let Some(previous) = self.value {
+            let alpha = 2.0 / (period as f64 + 1.0);
+            let value = alpha * close + (1.0 - alpha) * previous;
+            self.value = Some(value);
+            return Some(value);
+        }
+        self.count += 1;
+        self.seed_sum += close;
+        let previous_mean = self
+            .seed_mean
+            .unwrap_or_else(|| (self.seed_sum - close) / (self.count - 1).max(1) as f64);
+        let mean = if self.count == 1 {
+            close
+        } else {
+            previous_mean + (close - previous_mean) / self.count as f64
+        };
+        self.seed_mean = Some(mean);
+        if self.count == period {
+            self.value = Some(mean);
+            Some(mean)
+        } else {
+            None
+        }
+    }
+}
+
+/// Streaming EMA history is snapshot state because H4 frame compaction discards old bars.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct TrendPullbackState {
+    #[serde(default)]
+    fast: EmaState,
+    #[serde(default)]
+    slow: EmaState,
+    #[serde(default)]
+    previous_close: Option<f64>,
+    #[serde(default)]
+    last_bar_end: Option<i64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Swing {
     cfg: SwingConfig,
@@ -578,6 +711,8 @@ pub struct Swing {
     boxes: u64,
     last_impulse: Option<i64>,
     events: Vec<(i64, Event, i8)>,
+    #[serde(default)]
+    trend_pullback: TrendPullbackState,
 }
 fn default_true() -> bool {
     true
@@ -599,10 +734,47 @@ impl Swing {
             boxes: 0,
             last_impulse: None,
             events: vec![],
+            trend_pullback: TrendPullbackState::default(),
         }
     }
     pub fn trades(&self) -> &[Trade] {
         &self.trades
+    }
+    /// Removes warm-up trades already being managed by a retired configuration instance.
+    pub fn remove_duplicate_open_trades(&mut self, existing: &[Trade]) {
+        self.trades.retain(|trade| {
+            !matches!(trade.state, TradeState::Pending | TradeState::Active)
+                || !existing.iter().any(|old| {
+                    matches!(old.state, TradeState::Pending | TradeState::Active)
+                        && old.kind == trade.kind
+                        && old.dir == trade.dir
+                        && old.signal_t == trade.signal_t
+                })
+        });
+    }
+    /// Applies a trend-pullback cap to newly reconstructed trades while preserving
+    /// the existing signal context. `external_open_positions` are slots held by
+    /// other runtime instances for the same instrument.
+    pub fn limit_warm_open_positions(&mut self, external_open_positions: usize) {
+        let Some(limit) = self
+            .cfg
+            .trend_pullback
+            .as_ref()
+            .and_then(|parameters| parameters.max_open_positions)
+        else {
+            return;
+        };
+        let mut occupied = external_open_positions;
+        self.trades.retain(|trade| {
+            if !matches!(trade.state, TradeState::Pending | TradeState::Active) {
+                return true;
+            }
+            if occupied >= limit {
+                return false;
+            }
+            occupied += 1;
+            true
+        });
     }
     /// Fill order type for snapshots created before it was stored explicitly.
     pub fn normalize_legacy_entry_kinds(&mut self) {
@@ -695,6 +867,37 @@ impl Swing {
     }
     /// A bar of `tf` closed; `now` is the time at which the close is observed.
     pub fn close(&mut self, tf: Tf, b: Bar, now: i64) {
+        self.close_with_external_open_positions(tf, b, now, 0);
+    }
+    /// Close a bar while counting Pending/Active trades managed by other runtime
+    /// instances for this instrument against a family-specific position cap.
+    pub fn close_with_external_open_positions(
+        &mut self,
+        tf: Tf,
+        b: Bar,
+        now: i64,
+        external_open_positions: usize,
+    ) {
+        if self.cfg.family == StrategyFamily::TrendPullback {
+            if tf == Tf::H4
+                && self
+                    .trend_pullback
+                    .last_bar_end
+                    .is_some_and(|last| b.end <= last)
+            {
+                return;
+            }
+            match tf {
+                Tf::W => self.w.push(&b),
+                Tf::D => self.d.push(&b),
+                Tf::H4 => {
+                    self.h4.push(&b);
+                    self.trend_pullback_step(&b, now, external_open_positions);
+                }
+            }
+            self.compact();
+            return;
+        }
         match tf {
             Tf::W => self.w.push(&b),
             Tf::D => self.d.push(&b),
@@ -747,6 +950,111 @@ impl Swing {
         for k in 0..self.plans.len() {
             self.advance(k, tf, &b);
         }
+    }
+    fn trend_pullback_step(&mut self, bar: &Bar, now: i64, external_open_positions: usize) {
+        let Some(parameters) = self.cfg.trend_pullback.as_ref() else {
+            return;
+        };
+        let open_position_limit = parameters.max_open_positions;
+        let state = &mut self.trend_pullback;
+        let previous_close = state.previous_close;
+        let previous_fast = state.fast.value;
+        let previous_slow = state.slow.value;
+        let fast = state.fast.update(bar.close, parameters.fast_ema_bars);
+        let slow = state.slow.update(bar.close, parameters.slow_ema_bars);
+        state.previous_close = Some(bar.close);
+        state.last_bar_end = Some(bar.end);
+
+        let (
+            Some(previous_close),
+            Some(previous_fast),
+            Some(previous_slow),
+            Some(fast),
+            Some(slow),
+        ) = (previous_close, previous_fast, previous_slow, fast, slow)
+        else {
+            return;
+        };
+        if now.div_euclid(60) != bar.end.div_euclid(60)
+            || now < self.cfg.start
+            || !self.allow_new_plans
+        {
+            return;
+        }
+        let direction = if previous_fast > previous_slow
+            && fast > slow
+            && previous_close <= previous_fast
+            && bar.close > fast
+            && bar.close > slow
+        {
+            1
+        } else if previous_fast < previous_slow
+            && fast < slow
+            && previous_close >= previous_fast
+            && bar.close < fast
+            && bar.close < slow
+        {
+            -1
+        } else {
+            return;
+        };
+
+        // Closed-bar EMA state above is updated even when a confirmed entry is
+        // discarded. Check before the same-timestamp minute exits are applied.
+        if open_position_limit.is_some_and(|limit| {
+            self.trades
+                .iter()
+                .filter(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
+                .count()
+                .saturating_add(external_open_positions)
+                >= limit
+        }) {
+            return;
+        }
+
+        let lookback = self.cfg.stop_lookback_h4_bars;
+        let n = self.h4.len();
+        if n < self.cfg.atr_period || n < lookback {
+            return;
+        }
+        let (high, low) = self.h4.extremes(n - lookback, n);
+        let Some(atr) = self.h4.atr().filter(|value| *value > 0.0) else {
+            return;
+        };
+        let d = f64::from(direction);
+        let stop = if direction > 0 {
+            low - self.cfg.stop_buffer_atr * atr
+        } else {
+            high + self.cfg.stop_buffer_atr * atr
+        };
+        let entry = bar.close + d * self.cfg.cost;
+        if !entry.is_finite() || entry <= 0.0 || !stop.is_finite() || stop <= 0.0 {
+            return;
+        }
+        let risk = (entry - stop) * d;
+        if !risk.is_finite() || risk <= 0.0 {
+            return;
+        }
+        let tp = entry + d * self.cfg.rr_fixed * risk;
+        if !tp.is_finite() || tp <= 0.0 || (tp - entry) * d <= 0.0 {
+            return;
+        }
+        self.trades.push(Trade {
+            kind: Kind::TrendPullback,
+            dir: direction,
+            entry,
+            stop,
+            tp,
+            rr: self.cfg.rr_fixed,
+            signal_t: bar.end,
+            fill_t: Some(now),
+            entry_kind: Some(EntryKind::Market),
+            state: TradeState::Active,
+            r: None,
+            exit_t: None,
+            plan: None,
+            range_box: None,
+        });
     }
     fn weekly_plans(&mut self, b: &Bar) {
         let s = self.w.structure();

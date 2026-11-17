@@ -459,15 +459,242 @@ OpenAI получает документ с пояснениями и катал
 режима управления читаются совместимо.
 `Swing::compact` после каждой свечи удаляет данные, которые больше не влияют на решения.
 
-Ожидающая лимитная заявка не считается открытой сделкой для срока плана: она
-отменяется на `plan_days`-м дневном закрытии после создания плана, до проверки
-исполнения по следующей котировке. Исполненная сделка сопровождается до выхода;
-срок плана её не закрывает. Если одна котировка исполнила заявку и достигла
-стопа/тейка, оба события сохраняются и публикуются по порядку: исполнение, выход.
+Исследовательское расширение: `SwingConfig` выбирает типизированное семейство
+на уровне инструмента. Отсутствующее поле семейства в старом JSON и в старом
+снимке означает `legacy_swing`; новая конфигурация `trend_pullback` обязана
+содержать все параметры семейства и проходит тот же отказ на неизвестные поля.
+Счёт EMA и генерация намерения используют только закрытые H4 бары. Генератор
+намерений отделён от общего lifecycle сделки: `Trade`, sizing, минутное
+исполнение, выходы и snapshot-продолжение остаются общими. Семейство не
+подменяет уже опубликованные уровни.
 
-После изменения правил основной стратегии рассчитываются актуальные условия
-ожидающих планов и сообщаются в Telegram с теми же ID и временем жизни. Уровни
-опубликованных setup/active и завершённые результаты остаются прежними.
+Смешанный JSON может выбирать семейство независимо для каждой пары. Верхний
+`comments` описывает объединение leaf-параметров, фактически используемых
+инструментами; схема и `validate` проверяются отдельно для каждого семейства.
+Общая проверка `cost` требует конечное неотрицательное значение и не меняет
+расчёт legacy-уровней. Только `trend_pullback` дополнительно отбрасывает
+сделку, если рассчитанный вход, стоп, направленный риск или цель не конечны,
+если любая цена входа/стопа/цели не положительна либо риск не положителен.
+Это защищает новое семейство от переполнения и непригодных ценовых уровней.
+
+Round 2 добавляет необязательный `max_open_positions` в параметры
+`trend_pullback`. При отсутствии поля старый JSON/snapshot продолжает прежнее
+неограниченное поведение; если ключ указан, его значение должно быть
+положительным целым (`null` не означает отсутствие ключа и отклоняется). Новая
+исследовательская конфигурация явно ставит его в `1`. Ограничение
+не меняет legacy и риск допускаемой сделки (1R).
+
+Лимит действует только на новые `trend_pullback` входы и общий для инструмента:
+Runtime считает Pending/Active позиции текущего и retired `SwingMarket` до
+допуска нового сигнала. Core replay использует тот же счётчик по своим
+позициям. Уже сохранённые заявки и сделки никогда не отменяются/закрываются
+принудительно при смене лимита; если слотов занято больше нового лимита,
+входы остаются заблокированы до освобождения. Pending → Active сохраняет один
+слот; отмена или терминальный выход освобождает его в принятом порядке событий.
+Сигнал, полученный при полном
+лимите, отбрасывается без отложенного входа, при этом EMA/context продолжают
+обновляться. Проверка допуска происходит до `minute()` обработки выходов этой
+же котировки; одновременный выход не освобождает слот задним числом. Старые
+экземпляры продолжают сопровождение по исходной конфигурации и уровням.
+Runtime-регрессия формирует H4 закрытия через настоящие `Runtime::tick`:
+сигнал создаёт TP-сделку без внешней занятости, но блокируется при retired
+Pending и Active; блокировка сохраняется после restart, а новый вход допускается
+только после освобождения retired позиции.
+
+При смене конфигурации runtime сохраняет старый `SwingMarket` как retired
+экземпляр, отключает в нём создание новых планов и продолжает подавать ему
+котировки до закрытия его опубликованных Pending/Active сделок. Новый экземпляр
+прогревается под новую конфигурацию. Оба экземпляра сериализуются в snapshot;
+ключи опубликованных событий включают семью и исходное время сигнала, поэтому
+прогрев или рестарт не переиздают прежние сообщения. Старые snapshots без
+retired-списка читаются с пустым списком. Это поведение сначала фиксируется
+тестами restart/reconfigure и проверкой отсутствия дублей.
+
+Идентификатор сигнала нельзя считать новым только потому, что его позиция
+перешла в terminal state и ключ сопровождения был удалён. При повторном
+прогреве runtime сопоставляет стабильный signal ID с подтверждёнными сообщениями
+снимка и с сообщениями, которые ещё находятся в outbox. Чтение outbox не
+подтверждает и не удаляет сообщение. Поэтому delivered и pending terminal
+events одинаково предотвращают повторную публикацию и восстановление сделки
+для сопровождения; прежний снимок без `retired`-списка остаётся читаемым.
+Регрессионный pending-only тест оставляет outbox-события открытия и терминального
+выхода недоставленными при пустом `known`, затем сравнивает очередь до и после
+restart/reconfigure и проверяет отсутствие повторной публикации/сопровождения.
+
+Торговая сетка времени (UTC-котировка, преобразованная в naive
+America/New_York wall-time + 7h) передаётся только в расчёт swing. Текст
+события получает исходный UTC timestamp текущего Tick и форматирует его как
+RFC3339, включая стандартное смещение `+00:00`. Тот же UTC timestamp
+используется для сообщений от текущего и retired экземпляров.
+
+Для исторического сравнения семейство получает ту же M1 историю и агрегатор;
+сделки legacy baseline и candidate объединяются хронологически для общей
+portfolio MTM-оценки. Это эквивалентно одному interleaved runner только пока
+вход одной пары не зависит от позиции или сигнала другой пары. Если будет
+добавлен общий лимит риска/допуска, требуется единый портфельный симулятор.
+Любое изменение общего исполнения повторно запускает baseline тем же путём.
+
+#### Применённый swing-профиль после R010
+
+Рабочий `strategy/swing-rules.json` выбирает EURUSD и GBPUSD baseline, а для
+USDJPY — сохранённый qmc-018 в совместимом `legacy_swing` формате. Для USDJPY
+рабочий JSON содержит `rr_fixed=2.25`, `take_profit=target`,
+`rr_target_cap=3`, `plan_days=7`, lookback 20 H4 и buffer 0.025; исходные
+`start=1598918400`, `cost=0.01`, часы входа и прочие параметры сохранены.
+Источник параметров — qmc-018 JSON с SHA-256
+`6ea9e172228b2ebc4d2b6d4948bd77dbcdfdf06539d4b66febf374005ab292f1`.
+На проверенном V3 бинарнике фиксированный портфель прошёл NS-05 при ×1/×2/×3.
+Это результат исторического replay, а не результат живого подключения.
+
+#### Проект общего admission budget — V4-D4
+
+Проверяется фиксированный round007 profile: EURUSD qmc-027, GBPUSD qmc-086,
+USDJPY `rr_fixed=2` / `take_profit=target`; новые параметры не вводятся, риск
+каждой допущенной сделки — 1R. Candidate получает optional
+`portfolio_admission.max_open_positions=3`; отсутствующий объект оставляет
+baseline unbounded. Существующий per-pair TP cap сохраняет область действия.
+Main-engine сигналы, не ставшие сделками кандидата, не занимают portfolio slots.
+
+Один сериализуемый admission coordinator используется live Runtime и joint
+replay. Каждый `Swing` производит typed `EntryIntent`; принятый intent идёт через
+имеющийся lifecycle/executor. Внешний signal ID и compatibility CSV поля
+`signal_t`/`fill_t` остаются прежними. Ledger отдельно хранит
+`source_quote_time_utc`, `observed_at_utc`, `admitted_at_utc`, `executed_at_utc`,
+`exited_at_utc`, а также source row interval, quote/batch IDs, decision,
+reservations и initial risk. Для legacy `signal_t=bar.end` и compatibility
+`fill_t=bar.end` никогда не переносят causality назад.
+
+Live batch получает `observed_at_utc_ms` от инжектируемых system UTC wall clock
+часов сразу после полного ответа `markets()`. Это Unix milliseconds UTC, один
+captured timestamp для всех quotes ответа; durable inbox сохраняет его и batch ID
+до обработки, повтор использует прежнее значение. В историческом joint replay
+полная M1 строка `[start_utc_ms,end_utc_ms)` становится доступна на исключительной
+правой границе `end_utc_ms`; все admission/fill/exit, вызванные этой строкой,
+имеют это причинное время. Сохраняются исходный интервал и legacy timestamps.
+Исполнение цен/событий остаётся как в V3: market entry по предусмотренной
+движком цене с неблагоприятным cost, stop перед target по полному M1 high/low,
+ранее установленные fill levels. Не добавляется market fill по open или
+отдельное исполнение stop/target по open. OHLC не раскрывает точный момент
+внутриминутного касания; ledger фиксирует время доступности строки, не
+реконструирует касание. Полная строка с доступностью ровно на cutoff исключена
+из `[start, cutoff)`; future exits цензурируются, открытые сделки отмечаются
+последней строкой, доступной строго до cutoff. Raw CSV compatibility — отдельная
+проверка от новых причинных метрик; обе стороны сравниваются одним accounting,
+а baseline при необходимости пересчитывается, прежние числа не переносятся.
+
+Два watermarks независимы: `source_watermark_utc` — максимум обработанных
+допустимых source timestamps и используется только для source-late;
+`observed_watermark_utc` — причинный timestamp последнего обработанного события,
+его UTC-minute buckets управляют terminal reserve release. Source time не
+сравнивается с observed watermark. Оба сохраняются, retry пользуется сохранённым
+batch receive time. Source-late классифицируется по source watermark, сохранённому
+до batch; порядок соседних инструментов в batch не меняет классификацию. После
+обработки source watermark обновляется максимумом допустимых source timestamps.
+
+Live один полный `markets()` response является одним FIFO `MarketBatch`, одной
+atomic transaction и одной observed-minute группой, даже когда source timestamps
+пересекают границу минут. Внутри response порядок фаз: occupancy, admission всех
+intents по `(observed_at_utc, ASCII symbol bytes, intent_key)`, затем execution и
+exits. Выход не освобождает слот для другого входа этого же ответа. Для replay
+полная M1 строка относится к правой границе; группы доступности обрабатываются
+хронологически и в каждой повторяются occupancy→admission→execution/exit, после
+чего продвигается observed watermark. Пример A closes 10:00, B at 10:00 blocked,
+C at 10:01 admitted относится к разным replay availability times, не одному live
+response. Эквивалентность требует одних и тех же сохранённых causal times/order;
+разбиение live ответов, меняющее receive time, не обязано давать тот же выбор.
+Весь batch фиксирует coordinator, all Swing checkpoints, outbox и ledger
+атомарно; failure не потребляет slot и не оставляет частичного состояния.
+
+Tie-break для доступных intents: `(observed_at_utc, symbol ASCII bytes,
+intent_key)`. Внутренний `intent_key` versioned tuple
+`(config_generation:u64, family_code:u8, plan_id:UTF-8 bytes,
+source_event_ms:i64, direction_code:u8, intent_ordinal:u64)`. Числа сравниваются
+численно, строки — bytewise lexicographic; enum codes фиксированы versioned
+таблицей. `intent_ordinal` монотонен внутри config generation/symbol/family/plan,
+различает correction intents с одинаковыми внешним ID и source event и
+сохраняется в snapshot. Hash-map iteration не участвует. Quote dedup key включает
+pair/source/source timestamp/price; batch ID защищает от повторной обработки.
+Внешний опубликованный signal ID не меняется.
+
+Slot reservations и NS-05 risk — разные шкалы. Pending, Active и terminal
+reserves занимают slots; Pending→Active сохраняет один slot. Cancel/Stop/Target
+занимает его до `max(terminal_observed_minute, observed_watermark_minute)`
+включительно; release возможен только со следующей observed UTC-minute. NS-05
+peak open initial risk суммирует только исполненный initial risk Active-сделок
+между `executed_at_utc` и `exited_at_utc`, консервативно entry перед exit при
+равном времени. Pending не несёт open risk, перевод в Active учитывает initial
+risk один раз; terminal reserve не является риском. Peak reserved slots отдельно
+диагностирует cap и не заменяет NS-05 gate.
+
+Source-late quote определяется строго как
+`source_timestamp < source_watermark_utc`, относительно source watermark до batch.
+При включённом `portfolio_admission` она не создаёт новый admission. Без общего
+cap статус только диагностический и не блокирует прежний locally valid entry;
+per-symbol TP cap, local dedup и source ordering сохраняются. В обоих режимах
+локально допустимая late quote сопровождает existing Pending/Active, включая
+retired. Вызванные ею fill/exit датируются captured `observed_at_utc_ms` и не
+пересчитывают прошлое; освобождение slot не раньше следующей observed-minute.
+Это исправляет область запрета D3: запрещён только новый capped admission.
+
+`source_watermark_utc` восстанавливается из сохранённых source timestamps.
+Если старый snapshot не имеет `observed_watermark_utc`, запрещено выдавать
+`Tick.millis` за время получения. При первом обрабатываемом batch его captured
+observed time единожды сохраняется как `bootstrap_observed_at_utc_ms`; старый inbox
+без такого поля получает фактическое время начала первой обработки. Retry
+использует уже сохранённый timestamp. Occupancy восстанавливается из всех
+current/retired Pending+Active без изменения trade условий. При включённом cap
+admission закрыт на всю первую observed-minute bootstrap, но управление
+существующими Pending/Active работает сразу; admission возобновляется строго со
+следующей observed-minute при наличии слота. Bootstrap time/barrier сохраняются
+через restart. Без общего cap этот барьер не блокирует local admission. После
+batch source watermark становится максимумом допустимых source timestamps;
+observed watermark остаётся отдельными causal часами и управляет только
+minute-based terminal reserve. Source timestamps никогда не сравниваются с
+observed watermark.
+
+Config switch задаёт `switch_at_utc_ms` — UTC millisecond успешного атомарного
+commit проверенной конфигурации, вместе с новым `config_generation`. Source-grid
+`bar.end` переводится в UTC тем же DST-aware преобразованием. Для новой
+конфигурации `bar.end_utc <= switch_at_utc` — только контекст, даже если бар
+впервые обнаружен после gap. Новый intent допускается только от
+`bar.end_utc > switch_at_utc` и при фактическом наблюдении после границы;
+равенство относится к старой конфигурации. Retired pending/active продолжают
+сопровождаться на старых уровнях, а их причинные exits влияют на общий slot.
+Switch time, generation, current/retired Swing, coordinator watermarks, outbox и
+ledger сохраняются одним commit. Cold start совместно прогревает потоки всех
+пар одним coordinator; pair warmup с постфактум фильтрацией запрещён. Старый
+snapshot восстанавливает slots из current/retired Pending/Active без изменения
+условий. Source watermark берётся из saved source timestamps; отсутствующий
+observed watermark инициализируется только captured observed time первого batch
+(или началом первой обработки старого inbox без поля), не `Tick.millis`. При cap
+admission barrier занимает первую bootstrap observed-minute, но существующие
+сделки/ордера сопровождаются и исполняются сразу; barrier и captured time
+сохраняются так, чтобы restart не сбрасывал и не устанавливал его заново. Без
+cap barrier не блокирует local admission.
+
+При полном cap legacy plan остаётся `WaitEntry`, его сроки/уровни прежние;
+обработанный trigger помечается, скрытой очереди нет, повторный вход только от
+нового самостоятельного события. Context/индикаторы продолжают обновляться.
+Range rejection не создаёт Trade/`Sweep`, не увеличивает stop counter и не
+проверяет противоположную сторону на том же H4 событии.
+
+До реализации Docker RED покрывает: M1 open выше target при low, коснувшемся
+stop, сохраняет Stop V3 stop-first по full high/low; строка, доступная ровно на
+cutoff, исключена; V3 market price/cost/fill levels и raw CSV parity проверяются
+отдельно от пересчитанного baseline. Один live response с source timestamps по
+разные стороны минуты образует одну observed-minute admission-before-execution
+группу без same-response release. Проверяются предbatch source watermark,
+обычная delivery latency без ложного source-late, locally valid source-late quote,
+которая сопровождает current/retired Active и исполняет stop на captured observed
+time без нового capped admission, а rebound не отменяет выход. Сценарий выполняется
+capped/uncapped и после restart; release не раньше следующей observed-minute.
+Replay availability 10:00/10:01 проверяет A-close/B-block/C-admit. Отдельные RED:
+Pending reservation без open risk и один Active risk после fill; correction
+tie-break после restart; config switch после gap и late H4; старый snapshot без
+source/observed watermark, restart без сброса bootstrap barrier; один и тот же
+locally valid source-late H4 intent разрешён uncapped и запрещён capped при
+одинаковом management существующих сделок. Дизайн ждёт review; код/backtests не
+разрешены.
 
 ## Цели Docker-сборки
 
