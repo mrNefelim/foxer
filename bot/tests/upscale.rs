@@ -269,10 +269,7 @@ fn http_failures_keep_status_retry_after_without_body_or_key() {
 }
 
 fn index_rules() -> Value {
-    let mut v: Value =
-        serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap();
-    v["candles"]["price_basis"] = json!("index");
-    v
+    serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap()
 }
 #[test]
 fn index_strategy_and_integer_rounding_are_explicit() {
@@ -295,9 +292,9 @@ fn index_strategy_and_integer_rounding_are_explicit() {
 }
 #[test]
 fn index_runtime_restores_snapshot_and_rejects_other_sources() {
-    use forex_bot::{engine::Engine, feed::Tick, runtime::Runtime};
+    use forex_bot::{feed::Tick, runtime::Runtime};
     let p = std::env::temp_dir().join(format!("upscale-index-{}.sqlite", std::process::id()));
-    let mut r = Runtime::open(&p, index_rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, index_rules()).unwrap();
     let t = Tick {
         symbol: "EURUSD".into(),
         millis: 2000,
@@ -307,7 +304,7 @@ fn index_runtime_restores_snapshot_and_rejects_other_sources() {
     };
     r.tick(t.clone(), false).unwrap();
     drop(r);
-    let mut r = Runtime::open(&p, index_rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, index_rules()).unwrap();
     let pending = r.pending().unwrap().len();
     r.tick(t, false).unwrap();
     assert_eq!(r.pending().unwrap().len(), pending);

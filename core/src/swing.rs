@@ -35,9 +35,9 @@ pub fn grid_time(utc: i64) -> i64 {
 /// Bot candles (UTC close time, prices in millionths) as rule bars on the source grid,
 /// ordered by close time, then W, D, H4.
 pub fn rules_bars(
-    bars: &[(crate::engine::Timeframe, crate::trading::Candle, bool)],
+    bars: &[(crate::market::Timeframe, crate::market::Candle, bool)],
 ) -> Vec<(Tf, Bar)> {
-    use crate::engine::Timeframe;
+    use crate::market::Timeframe;
     const SCALE: f64 = 1_000_000.0;
     let mut out: Vec<(Tf, Bar)> = bars
         .iter()
@@ -244,6 +244,49 @@ impl Default for SwingConfig {
 impl SwingConfig {
     /// Validates family-specific parameters after backwards-compatible deserialization.
     pub fn validate(&self) -> Result<(), String> {
+        if self.atr_period == 0 || self.plan_days == 0 || self.stop_lookback_h4_bars == 0 {
+            return Err("Swing periods must be positive".into());
+        }
+        if !self.rr_fixed.is_finite()
+            || self.rr_fixed <= 0.0
+            || !self.rr_target_cap.is_finite()
+            || self.rr_target_cap <= 0.0
+        {
+            return Err("Swing RR and target cap must be finite and positive".into());
+        }
+        if !self.stop_buffer_atr.is_finite() || self.stop_buffer_atr < 0.0 || self.start < 0 {
+            return Err("invalid Swing stop buffer or start".into());
+        }
+        let mut hours = std::collections::BTreeSet::new();
+        if self.entry_close_hours.is_empty()
+            || self
+                .entry_close_hours
+                .iter()
+                .any(|hour| !(0..24).contains(hour) || !hours.insert(*hour))
+        {
+            return Err("Swing entry hours must be nonempty, unique and within 0..23".into());
+        }
+        let range = &self.range;
+        if range.min_h4_bars == 0
+            || range.window_min == 0
+            || range.window_max < range.window_min
+            || range.impulse_bars == 0
+            || range.max_stops_per_border == 0
+            || range.height_max_atr_d <= 0.0
+            || range.height_max_atr_d < range.height_min_atr_d
+            || [
+                range.height_min_atr_d,
+                range.height_max_atr_d,
+                range.impulse_min_atr_d,
+                range.impulse_min_ratio,
+                range.break_fraction,
+                range.wick_min,
+            ]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err("invalid Swing range parameters".into());
+        }
         if !self.cost.is_finite() || self.cost < 0.0 {
             return Err("swing cost must be finite and nonnegative".into());
         }

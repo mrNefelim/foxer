@@ -38,7 +38,7 @@ fn err(_: rusqlite::Error) -> String {
 impl Store {
     pub fn retire_level_revisions(&mut self, snapshot: &Value) -> Result<(), String> {
         let tx = self.db.transaction().map_err(err)?;
-        tx.execute("UPDATE outbox SET delivered=1 WHERE delivered=0 AND (json_type(payload,'$.revision') IS NOT NULL OR id LIKE 'revision:%' OR id LIKE 'reconfigure:%')", []).map_err(err)?;
+        tx.execute("UPDATE outbox SET delivered=1 WHERE delivered=0 AND (json_type(payload,'$.revision') IS NOT NULL OR id LIKE 'revision:%' OR id LIKE 'reconfigure:%' OR id LIKE 'conditions:%' OR (id LIKE 'tick:%' AND ((json_type(payload,'$.signal_id')='text' AND instr(json_extract(payload,'$.signal_id'), ':swing:')=0) OR id LIKE '%:W_trend_new%' OR id LIKE '%:W_trend_end%' OR id LIKE '%:W_trend_flip%')))", []).map_err(err)?;
         tx.execute("INSERT INTO entities(kind,key,payload) VALUES('runtime','coordinator',?1) ON CONFLICT(kind,key) DO UPDATE SET payload=excluded.payload", [snapshot.to_string()]).map_err(err)?;
         tx.commit().map_err(err)
     }

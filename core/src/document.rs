@@ -81,17 +81,8 @@ pub fn without_comments(v: &Value) -> Result<Value, String> {
     })
 }
 pub fn calculations(v: &Value) -> Result<Value, String> {
-    let c: crate::model::Strategy =
-        serde_json::from_value(v.clone()).map_err(|_| "structure: invalid strategy")?;
-    crate::validate(&c)?;
-    let mut out = serde_json::to_value(c).map_err(|_| "strategy serialization")?;
-    out.as_object_mut().unwrap().remove("messages");
-    // Rule ordering is not a policy: identities select algorithms.
-    for key in ["weekly_rules", "daily_rules"] {
-        out["policies"]["plans"][key]
-            .as_array_mut()
-            .unwrap()
-            .sort_by_key(Value::to_string);
-    }
-    Ok(out)
+    let strategy: crate::model::Strategy =
+        serde_json::from_value(v.clone()).map_err(|_| "structure: invalid Swing strategy")?;
+    crate::validate(&strategy)?;
+    Ok(serde_json::json!({"instruments": strategy.instruments}))
 }

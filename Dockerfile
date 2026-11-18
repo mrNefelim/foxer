@@ -29,6 +29,5 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 WORKDIR /app
 COPY --from=backtest-build /build/target/release/forex-backtest /usr/local/bin/forex-backtest
 COPY backtest/report backtest/report
-COPY backtest/data-sources.json backtest/data-sources.json
 ENV MPLCONFIGDIR=/tmp/matplotlib PYTHONDONTWRITEBYTECODE=1
 ENTRYPOINT ["forex-backtest"]

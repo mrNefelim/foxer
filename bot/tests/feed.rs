@@ -1,5 +1,5 @@
-use forex_bot::engine::Timeframe;
 use forex_bot::feed::{Aggregator, Tick};
+use forex_bot::market::Timeframe;
 fn tick(ms: i64, price: i64) -> Tick {
     Tick {
         symbol: "EURUSD".into(),

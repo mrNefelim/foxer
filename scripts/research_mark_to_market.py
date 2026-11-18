@@ -84,8 +84,8 @@ def load_common_quotes(database, result):
             result_source = _declared_result_source(provenance, symbol)
             if result_source != source:
                 raise ValueError(f'{symbol}: result/database source mismatch')
-            # Restrict using indexed second timestamps; the quote is the observed
-            # M1 close used by the existing synthetic path at minute start +59s.
+            # Restrict using indexed second timestamps; observed M1 closes are
+            # valued at minute start +59s, without reconstructing intraminute ticks.
             lo, hi = (start - 59000 + 999) // 1000, (end - 59000 + 999) // 1000
             rows = db.execute("SELECT timestamp*1000+59000,json_extract(payload,'$.price[3]') "
                               'FROM minutes WHERE symbol=? AND source=? AND timestamp>=? '

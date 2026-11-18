@@ -275,7 +275,7 @@ fn compaction_keeps_only_recent_bars_and_the_absolute_bar_count() {
 
 #[test]
 fn rules_bars_convert_bot_candles_to_the_source_grid_in_order() {
-    use forex_core::{engine::Timeframe, trading::Candle};
+    use forex_core::{market::Candle, market::Timeframe};
     let c = |end| Candle {
         end,
         open: 1_100_000,

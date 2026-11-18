@@ -1,5 +1,5 @@
 //! Swing rules in the live runtime (requirements: Правила «свинг» в работе бота).
-use forex_bot::{engine::Engine, feed::Tick, runtime::Runtime};
+use forex_bot::{feed::Tick, runtime::Runtime};
 use forex_core::swing::{Bar, Kind, Swing, SwingConfig, Tf, TradeState};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -14,7 +14,7 @@ fn path() -> std::path::PathBuf {
     ))
 }
 fn rules() -> Value {
-    serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap()
+    serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap()
 }
 fn legacy_fixture() -> Value {
     serde_json::from_str(include_str!("../../tests/fixtures/swing-legacy-rules.json")).unwrap()
@@ -134,6 +134,9 @@ fn tick_for(symbol: &str, at: &str, price: f64) -> Tick {
 }
 /// Three H4 bars on 2026-01-05 whose third leaves a bullish gap; the 22:00Z tick closes it.
 fn gap_ticks(r: &mut Runtime) {
+    gap_ticks_for(r, "EURUSD");
+}
+fn gap_ticks_for(r: &mut Runtime, symbol: &str) {
     for (at, p) in [
         ("2026-01-05T10:00:00Z", 1.10000),
         ("2026-01-05T10:30:00Z", 1.10100),
@@ -147,7 +150,7 @@ fn gap_ticks(r: &mut Runtime) {
         ("2026-01-05T21:59:00Z", 1.10250),
         ("2026-01-05T22:00:00Z", 1.10250),
     ] {
-        r.tick(tick(at, p), true).unwrap();
+        r.tick(tick_for(symbol, at, p), true).unwrap();
     }
 }
 fn gap_ticks_on(r: &mut Runtime, day: &str) {
@@ -194,7 +197,7 @@ fn first_quote_limit_fill(
     dir: i8,
 ) -> (std::path::PathBuf, forex_core::swing::Trade, String, String) {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     let mut initial = Swing::new(serde_json::from_value::<SwingConfig>(config()).unwrap());
     if dir > 0 {
         initial.add_plan(Kind::Trend, 1, (1.0, 1.05), 1.105, Tf::H4);
@@ -240,7 +243,7 @@ fn first_quote_limit_fill(
 #[test]
 fn swing_trade_is_published_with_its_levels() {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.swing("EURUSD", config(), || Ok(planned())).unwrap();
     gap_ticks(&mut r);
     assert_eq!(count(&r, "EUR/USD · покупка · тренд"), 1);
@@ -257,11 +260,11 @@ fn swing_trade_is_published_with_its_levels() {
 fn state_survives_a_restart_without_repeating_messages() {
     let p = path();
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks(&mut r);
     }
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.swing("EURUSD", config(), || Err("must not warm up again".into()))
         .unwrap();
     assert_eq!(count(&r, "Сделка открыта"), 1);
@@ -274,7 +277,7 @@ fn state_survives_a_restart_without_repeating_messages() {
 fn same_quote_fill_and_stop_are_both_published_once_across_restart() {
     let p = path();
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
         gap_ticks(&mut r);
         assert_eq!(count(&r, "Лимитная заявка"), 1);
@@ -282,7 +285,7 @@ fn same_quote_fill_and_stop_are_both_published_once_across_restart() {
 
     let exit = tick("2026-01-05T22:30:00Z", 1.09800);
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Err("must restore snapshot".into()))
             .unwrap();
         r.tick(exit.clone(), true).unwrap();
@@ -298,7 +301,7 @@ fn same_quote_fill_and_stop_are_both_published_once_across_restart() {
         assert_eq!(count(&r, "Стоп"), 1);
     }
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(count(&r, "Заявка исполнена"), 1);
     assert_eq!(count(&r, "Стоп"), 1);
     std::fs::remove_file(p).ok();
@@ -307,7 +310,7 @@ fn same_quote_fill_and_stop_are_both_published_once_across_restart() {
 #[test]
 fn first_close_fill_and_stop_publishes_limit_fill_exit_in_order_across_restart() {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
     for (at, price) in [
         ("2026-01-05T10:00:00Z", 1.10000),
@@ -362,7 +365,7 @@ fn first_close_fill_and_stop_publishes_limit_fill_exit_in_order_across_restart()
     assert_eq!(count(&r, "Стоп"), 1);
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(count(&r, "Лимитная заявка"), 1);
     assert_eq!(count(&r, "Заявка исполнена"), 1);
     assert_eq!(count(&r, "Стоп"), 1);
@@ -372,7 +375,7 @@ fn first_close_fill_and_stop_publishes_limit_fill_exit_in_order_across_restart()
 #[test]
 fn first_close_limit_fill_while_active_publishes_limit_then_fill_once() {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
     for (at, price) in [
         ("2026-01-05T10:00:00Z", 1.10000),
@@ -427,7 +430,7 @@ fn first_close_limit_fill_while_active_publishes_limit_then_fill_once() {
     assert_eq!(count(&r, "Стоп"), 0);
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(count(&r, "Лимитная заявка"), 1);
     assert_eq!(count(&r, "Заявка исполнена"), 1);
     assert_eq!(count(&r, "Стоп"), 0);
@@ -484,7 +487,7 @@ fn limit_notification_uses_original_price_and_rr_for_sell() {
 fn legacy_pending_snapshot_without_entry_kind_keeps_limit_identity() {
     let p = path();
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
         gap_ticks(&mut r);
         assert_eq!(
@@ -503,7 +506,7 @@ fn legacy_pending_snapshot_without_entry_kind_keeps_limit_identity() {
     store.save_runtime(&snapshot).unwrap();
     drop(store);
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.tick(tick("2026-01-05T22:30:00Z", 1.09800), true).unwrap();
     let messages = texts(&r);
     let fill = messages
@@ -518,7 +521,7 @@ fn legacy_pending_snapshot_without_entry_kind_keeps_limit_identity() {
     assert_eq!(count(&r, "Стоп"), 1);
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(count(&r, "Заявка исполнена"), 1);
     assert_eq!(count(&r, "Стоп"), 1);
     std::fs::remove_file(p).ok();
@@ -528,7 +531,7 @@ fn legacy_pending_snapshot_without_entry_kind_keeps_limit_identity() {
 fn disabled_swing_keeps_pending_order_and_tracks_it_after_restarts() {
     let p = path();
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
         gap_ticks(&mut r);
         assert_eq!(
@@ -537,7 +540,7 @@ fn disabled_swing_keeps_pending_order_and_tracks_it_after_restarts() {
         );
     }
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     let before = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
     r.reconcile_swing(&BTreeSet::new()).unwrap();
     let pending = &r.swing_rules("EURUSD").unwrap().trades()[0];
@@ -561,7 +564,7 @@ fn disabled_swing_keeps_pending_order_and_tracks_it_after_restarts() {
     let active_before_restart = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
     drop(r);
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     let active = &r.swing_rules("EURUSD").unwrap().trades()[0];
     assert_eq!(active.state, forex_core::swing::TradeState::Active);
     assert_eq!(
@@ -577,7 +580,7 @@ fn disabled_swing_keeps_pending_order_and_tracks_it_after_restarts() {
     assert_eq!(count(&r, "Стоп"), 1);
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(count(&r, "Заявка исполнена"), 1);
     assert_eq!(count(&r, "Стоп"), 1);
     std::fs::remove_file(p).ok();
@@ -587,13 +590,13 @@ fn disabled_swing_keeps_pending_order_and_tracks_it_after_restarts() {
 fn open_trades_from_the_warm_up_are_announced_once() {
     let p = path();
     let warm = {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks(&mut r);
         r.swing_rules("EURUSD").unwrap().clone()
     };
     let p2 = path();
-    let mut r = Runtime::open(&p2, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p2, rules()).unwrap();
     r.swing("EURUSD", config(), || Ok(warm.clone())).unwrap();
     r.swing("EURUSD", config(), || Ok(warm.clone())).unwrap();
     assert_eq!(count(&r, "до запуска"), 1);
@@ -605,7 +608,7 @@ fn open_trades_from_the_warm_up_are_announced_once() {
 #[test]
 fn changed_parameters_warm_up_again_and_index_exit_is_rejected() {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.swing("EURUSD", config(), || Ok(planned())).unwrap();
     let mut warmed = false;
     let mut changed = config();
@@ -630,7 +633,7 @@ fn changed_parameters_warm_up_again_and_index_exit_is_rejected() {
 fn reconfigure_and_restart_keep_published_trade_on_its_original_levels() {
     let p = path();
     let before = {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks(&mut r);
         let trade = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
@@ -646,7 +649,7 @@ fn reconfigure_and_restart_keep_published_trade_on_its_original_levels() {
     };
 
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         let stop_quote = before.stop - 0.0001;
         r.tick(tick("2026-01-05T22:30:00Z", stop_quote), true)
             .unwrap();
@@ -656,7 +659,7 @@ fn reconfigure_and_restart_keep_published_trade_on_its_original_levels() {
             "retired strategy must keep managing the old trade"
         );
     }
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(count(&r, "Стоп"), 1, "restart must not duplicate the exit");
     let _ = std::fs::remove_file(p);
 }
@@ -665,7 +668,7 @@ fn reconfigure_and_restart_keep_published_trade_on_its_original_levels() {
 fn a_pending_order_survives_family_change_with_its_frozen_execution_config() {
     let p = path();
     let before = {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
         gap_ticks(&mut r);
         let trade = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
@@ -700,12 +703,12 @@ fn a_pending_order_survives_family_change_with_its_frozen_execution_config() {
     };
 
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.tick(tick("2026-01-05T22:30:00Z", before.entry - 0.0001), true)
             .unwrap();
         assert_eq!(count(&r, "Заявка исполнена"), 1);
     }
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(
         count(&r, "Заявка исполнена"),
         1,
@@ -720,7 +723,7 @@ fn runtime_h4_ticks_block_on_retired_slots_then_admit_after_release() {
     let p = path();
     let mut old_pending;
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
         gap_ticks(&mut r);
         old_pending = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
@@ -751,7 +754,7 @@ fn runtime_h4_ticks_block_on_retired_slots_then_admit_after_release() {
         old_pending.tp = old_tp;
         old_pending.rr = 2.0;
         drop(r);
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
 
         // These bars would confirm the TP entry at 06:00Z without an external
         // slot; the retired Pending legacy order must reserve the only slot.
@@ -781,7 +784,7 @@ fn runtime_h4_ticks_block_on_retired_slots_then_admit_after_release() {
 
     // Restart must preserve the retired Active slot. A second actual TP signal
     // at 22:00Z is blocked while that position remains open.
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     let blocked_closes = [
         ("2026-01-06T10:00:00Z", 1.105),
         ("2026-01-06T14:00:00Z", 1.104),
@@ -839,7 +842,7 @@ fn runtime_h4_ticks_block_on_retired_slots_then_admit_after_release() {
 #[test]
 fn warm_up_does_not_republish_a_trade_already_retired_from_the_old_family() {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     r.swing("EURUSD", config(), || Ok(planned())).unwrap();
     gap_ticks(&mut r);
     let warm = r.swing_rules("EURUSD").unwrap().clone();
@@ -869,7 +872,7 @@ fn terminal_signal_warmup_case(deliver_terminal: bool) {
     let p = path();
     let warm_active;
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks(&mut r);
         let active = r.swing_rules("EURUSD").unwrap().clone();
@@ -897,7 +900,7 @@ fn terminal_signal_warmup_case(deliver_terminal: bool) {
         }
     }
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     let queue_before = pending_state(&r);
     let mut changed = config();
     changed["cost"] = json!(0.0002);
@@ -913,7 +916,7 @@ fn terminal_signal_warmup_case(deliver_terminal: bool) {
     );
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(
         pending_state(&r),
         queue_before,
@@ -939,7 +942,7 @@ fn pending_open_and_stop_survive_restart_reconfigure_without_republication() {
     let warm_active;
     let queued_before;
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks(&mut r);
         warm_active = r.swing_rules("EURUSD").unwrap().clone();
@@ -989,7 +992,7 @@ fn pending_open_and_stop_survive_restart_reconfigure_without_republication() {
         assert_eq!(snapshot["known"].as_object().unwrap().len(), 0);
     }
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(
         pending_state(&r),
         queued_before,
@@ -1020,7 +1023,7 @@ fn pending_open_and_stop_survive_restart_reconfigure_without_republication() {
     );
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(
         pending_state(&r),
         queued_before,
@@ -1034,7 +1037,7 @@ fn pending_open_and_stop_survive_restart_reconfigure_without_republication() {
 fn legacy_snapshot_without_retired_field_still_reads_and_manages_current_position() {
     let p = path();
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks(&mut r);
     }
@@ -1049,7 +1052,7 @@ fn legacy_snapshot_without_retired_field_still_reads_and_manages_current_positio
     store.save_runtime(&snapshot).unwrap();
     drop(store);
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     assert_eq!(
         r.swing_rules("EURUSD").unwrap().trades()[0].state,
         forex_core::swing::TradeState::Active
@@ -1066,7 +1069,7 @@ fn retired_swing_exit_messages_use_actual_utc_quote_time_for_winter_and_summer()
         ("2026-07-06", "2026-07-06T22:30:00+00:00"),
     ] {
         let p = path();
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned())).unwrap();
         gap_ticks_on(&mut r, day);
         let old = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
@@ -1094,7 +1097,7 @@ fn retired_swing_exit_messages_use_actual_utc_quote_time_for_winter_and_summer()
 #[test]
 fn family_choice_is_per_instrument_and_legacy_json_defaults_to_swing() {
     let p = path();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     for symbol in ["EURUSD", "GBPUSD", "USDJPY"] {
         let mut config = instrument_config(symbol);
         if symbol == "GBPUSD" {
@@ -1138,7 +1141,7 @@ fn family_choice_is_per_instrument_and_legacy_json_defaults_to_swing() {
 #[test]
 fn warm_up_replays_stored_minutes_through_the_bot_aggregator() {
     let p = path();
-    drop(Runtime::open(&p, rules(), Engine::default()).unwrap());
+    drop(Runtime::open(&p, rules()).unwrap());
     let db = rusqlite::Connection::open(&p).unwrap();
     let start = forex_core::prices::utc("2026-01-05T00:00:00Z").unwrap();
     for i in 0..(5 * 24 * 60) {
@@ -1240,7 +1243,7 @@ fn retired_pending_and_active_positions_reserve_new_trend_cap_across_restart() {
     let old_pending;
     let outbox_before;
     {
-        let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+        let mut r = Runtime::open(&p, rules()).unwrap();
         r.swing("EURUSD", config(), || Ok(planned_limit())).unwrap();
         gap_ticks(&mut r);
         old_pending = r.swing_rules("EURUSD").unwrap().trades()[0].clone();
@@ -1259,7 +1262,7 @@ fn retired_pending_and_active_positions_reserve_new_trend_cap_across_restart() {
         assert_eq!(pending_state(&r), outbox_before);
     }
 
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     let cap_one_after_restart = trend_config_with_limit(1, 0.0002);
     r.swing("EURUSD", cap_one_after_restart.clone(), || {
         Ok(warm_trend(
@@ -1338,7 +1341,7 @@ fn retired_pending_and_active_positions_reserve_new_trend_cap_across_restart() {
     );
     drop(r);
 
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     assert!(r.swing_rules("EURUSD").unwrap().trades().is_empty());
     let snapshot = forex_bot::state::Store::open(&p)
         .unwrap()
@@ -1354,5 +1357,164 @@ fn retired_pending_and_active_positions_reserve_new_trend_cap_across_restart() {
         .filter(|trade| trade["state"] == "Active")
         .count();
     assert_eq!(active_after_restart, 2);
+    std::fs::remove_file(p).ok();
+}
+
+#[test]
+fn legacy_engine_snapshot_preserves_current_retired_comments_outbox_and_event_replay() {
+    use forex_bot::state::{Entity, Kind as EntityKind, Outbound, Store};
+    let p = path();
+    let mut runtime = Runtime::open(&p, rules()).unwrap();
+    runtime.swing("EURUSD", config(), || Ok(planned())).unwrap();
+    gap_ticks(&mut runtime);
+    let retired_trade = runtime.swing_rules("EURUSD").unwrap().trades()[0].clone();
+    let next = trend_config();
+    runtime
+        .swing("EURUSD", next.clone(), || {
+            Ok(Swing::new(serde_json::from_value(next).unwrap()))
+        })
+        .unwrap();
+    runtime
+        .swing("GBPUSD", instrument_config("GBPUSD"), || {
+            Ok(planned_limit_for("GBPUSD"))
+        })
+        .unwrap();
+    gap_ticks_for(&mut runtime, "GBPUSD");
+    assert_eq!(
+        runtime.swing_rules("GBPUSD").unwrap().trades()[0].state,
+        TradeState::Pending
+    );
+    let published = runtime.pending().unwrap()[0].id.clone();
+    runtime.delivered(&published, 500).unwrap();
+    runtime.update(&json!({"update_id":99,"message":{"message_id":600,"chat":{"id":-1},"from":{"id":11},"text":"Проверь стоп","reply_to_message":{"message_id":500}}}), -1).unwrap();
+    runtime.api_outage().unwrap();
+    let pending = pending_state(&runtime);
+    drop(runtime);
+
+    let mut store = Store::open(&p).unwrap();
+    let mut legacy = store.entities(EntityKind::Runtime).unwrap()[0]
+        .value
+        .clone();
+    let expected_swing = legacy["markets"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(symbol, market)| (symbol.clone(), market["swing"].clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    legacy["hash_version"] = json!(2);
+    legacy.as_object_mut().unwrap().remove("swing_context");
+    legacy["rules_hash"] = json!("previous-fvg-calculation-hash");
+    for market in legacy["markets"].as_object_mut().unwrap().values_mut() {
+        // This is deliberately not deserializable as an Engine. The removed engine
+        // is opaque legacy data and must never prevent restoring the Swing state.
+        market["engine"] = json!({"old_fvg_state": {"signals": ["legacy-format"]}});
+    }
+    let expected_queue = legacy["queue"].clone();
+    let expected_known = legacy["known"].clone();
+    let expected_texts = legacy["texts"].clone();
+    let expected_context = legacy["reply_context"].clone();
+    store
+        .apply(
+            "old-app-fixture",
+            &json!({"fixture":true}),
+            &[Entity {
+                kind: EntityKind::Runtime,
+                key: "coordinator".into(),
+                value: legacy,
+            }],
+            &[
+                Outbound {
+                    id: "tick:legacy:EURUSD:old-plan".into(),
+                    payload: json!({"signal_id":"EURUSD:old-plan","text":"legacy FVG"}),
+                },
+                Outbound {
+                    id: "tick:legacy:W_trend_new".into(),
+                    payload: json!({"text":"legacy weekly"}),
+                },
+            ],
+        )
+        .unwrap();
+    drop(store);
+
+    for _ in 0..2 {
+        let mut restored = Runtime::open(&p, rules()).unwrap();
+        assert_eq!(restored.offset(), 100);
+        assert_eq!(restored.next_comment().unwrap().update_id, 99);
+        assert_eq!(pending_state(&restored), pending);
+        restored
+            .tick(tick_for("GBPUSD", "2026-01-05T22:00:00Z", 1.10250), true)
+            .unwrap();
+        assert_eq!(pending_state(&restored), pending);
+        let snapshot = Store::open(&p)
+            .unwrap()
+            .entities(EntityKind::Runtime)
+            .unwrap()[0]
+            .value
+            .clone();
+        assert_eq!(snapshot["calendar_version"], 4);
+        assert_eq!(snapshot["hash_version"], 3);
+        for (symbol, swing) in &expected_swing {
+            assert_eq!(&snapshot["markets"][symbol]["swing"], swing);
+            assert!(snapshot["markets"][symbol].get("engine").is_none());
+        }
+        assert_eq!(snapshot["queue"], expected_queue);
+        assert_eq!(snapshot["known"], expected_known);
+        assert_eq!(snapshot["texts"], expected_texts);
+        assert_eq!(snapshot["reply_context"], expected_context);
+        drop(restored);
+    }
+    let mut restored = Runtime::open(&p, rules()).unwrap();
+    let exit = tick("2026-01-05T22:30:00Z", retired_trade.stop - 0.0001);
+    restored.tick(exit.clone(), false).unwrap();
+    restored.tick(exit, false).unwrap();
+    assert_eq!(count(&restored, "Стоп"), 1);
+    drop(restored);
+    let restored = Runtime::open(&p, rules()).unwrap();
+    assert_eq!(count(&restored, "Стоп"), 1);
+    std::fs::remove_file(p).ok();
+}
+
+#[test]
+fn terminal_swing_reply_keeps_exact_trade_context_after_delivery_and_restart() {
+    let p = path();
+    let mut runtime = Runtime::open(&p, rules()).unwrap();
+    runtime.swing("EURUSD", config(), || Ok(planned())).unwrap();
+    gap_ticks(&mut runtime);
+    let original = runtime.swing_rules("EURUSD").unwrap().trades()[0].clone();
+    runtime
+        .tick(tick("2026-01-05T22:30:00Z", original.stop - 0.0001), true)
+        .unwrap();
+    assert!(runtime.swing_rules("EURUSD").unwrap().trades().is_empty());
+    let terminal = runtime
+        .pending()
+        .unwrap()
+        .into_iter()
+        .find(|out| out.payload["text"].as_str().unwrap().contains("Стоп"))
+        .unwrap();
+    let signal_id = terminal.payload["signal_id"].as_str().unwrap().to_owned();
+    runtime.delivered(&terminal.id, 700).unwrap();
+    drop(runtime);
+    let mut runtime = Runtime::open(&p, rules()).unwrap();
+    runtime.update(&json!({"update_id":123,"message":{"message_id":701,"chat":{"id":-1},"from":{"id":11},"text":"Объясни стоп","reply_to_message":{"message_id":700}}}), -1).unwrap();
+    let context = runtime.comment_context(&runtime.next_comment().unwrap());
+    assert_eq!(context["signal"]["id"], signal_id);
+    assert_eq!(context["signal"]["symbol"], "EURUSD");
+    assert_eq!(context["signal"]["trade"]["state"], "Stop");
+    for (field, expected) in [("stop", original.stop), ("entry", original.entry)] {
+        // Match the existing Swing snapshot precision contract (far below one
+        // millionth price unit); JSON parsing may change the last f64 bit.
+        assert!((context["signal"]["trade"][field].as_f64().unwrap() - expected).abs() < 1e-12);
+    }
+    assert_eq!(context["signal"]["config"], config());
+    assert!(context["replied_message"]
+        .as_str()
+        .unwrap()
+        .contains("Стоп"));
+    drop(runtime);
+    let runtime = Runtime::open(&p, rules()).unwrap();
+    assert_eq!(
+        runtime.comment_context(&runtime.next_comment().unwrap()),
+        context
+    );
     std::fs::remove_file(p).ok();
 }

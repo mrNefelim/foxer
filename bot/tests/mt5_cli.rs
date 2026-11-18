@@ -23,8 +23,8 @@ impl Fixture {
         ));
         fs::create_dir_all(root.join("strategy")).unwrap();
         fs::write(
-            root.join("strategy/fvg-bot-rules.json"),
-            include_str!("../../strategy/fvg-bot-rules.json"),
+            root.join("strategy/swing-rules.json"),
+            include_str!("../../strategy/swing-rules.json"),
         )
         .unwrap();
         Self { root }

@@ -32,7 +32,7 @@ fn smoke_binary_restores_queue_and_refuses_existing_database() {
         .args([
             "smoke-test",
             p.to_str().unwrap(),
-            "../strategy/fvg-bot-rules.json",
+            "../strategy/swing-rules.json",
         ])
         .output()
         .unwrap();
@@ -47,7 +47,7 @@ fn smoke_binary_restores_queue_and_refuses_existing_database() {
         .args([
             "smoke-test",
             p.to_str().unwrap(),
-            "../strategy/fvg-bot-rules.json",
+            "../strategy/swing-rules.json",
         ])
         .output()
         .unwrap();

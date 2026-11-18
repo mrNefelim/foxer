@@ -1,6 +1,9 @@
 //! Swing replay over prepared minutes through the bot's own bar aggregator.
 use forex_backtest::swing_history::*;
-use forex_core::{engine::Timeframe, swing::Tf, trading::Candle};
+use forex_core::{
+    market::{Candle, Timeframe},
+    swing::Tf,
+};
 
 #[test]
 fn aggregator_bars_reach_the_rules_in_time_order_on_the_source_grid() {

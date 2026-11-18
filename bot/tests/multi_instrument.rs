@@ -1,11 +1,10 @@
 use forex_bot::{
-    engine::Engine,
     runtime::Runtime,
     state::{Kind, Store},
 };
 use serde_json::{json, Value};
 fn rules() -> Value {
-    let v: Value = serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap();
+    let v: Value = serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap();
     v
 }
 fn path(name: &str) -> std::path::PathBuf {
@@ -14,17 +13,17 @@ fn path(name: &str) -> std::path::PathBuf {
 #[test]
 fn restart_uses_supplied_json_not_database_rules() {
     let p = path("source");
-    let r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let r = Runtime::open(&p, rules()).unwrap();
     drop(r);
     let mut updated = rules();
-    updated["parameters"]["stop_buffer_atr"]["value"] = json!(0.7);
-    let r = Runtime::open(&p, updated.clone(), Engine::default()).unwrap();
+    updated["instruments"]["EURUSD"]["stop_buffer_atr"] = json!(0.7);
+    let r = Runtime::open(&p, updated.clone()).unwrap();
     assert_eq!(r.rules(), updated);
 }
 #[test]
 fn snapshot_does_not_store_rules() {
     let p = path("no-rules");
-    drop(Runtime::open(&p, rules(), Engine::default()).unwrap());
+    drop(Runtime::open(&p, rules()).unwrap());
     let s = Store::open(&p).unwrap();
     assert!(s.entities(Kind::Runtime).unwrap()[0]
         .value
@@ -33,11 +32,8 @@ fn snapshot_does_not_store_rules() {
 }
 #[test]
 fn configuration_accepts_multiple_pairs() {
-    let mut v = rules();
-    v["instruments"] = json!([
- {"symbol":"EURUSD","price_tick":1},
- {"symbol":"GBPUSD","price_tick":1},
- {"symbol":"USDJPY","price_tick":1}]);
+    let v = rules();
+    assert_eq!(v["instruments"].as_object().unwrap().len(), 3);
     let c = serde_json::from_value(v).unwrap();
     assert!(forex_bot::validate(&c).is_ok());
 }
@@ -62,7 +58,7 @@ fn aggregator_accepts_gbp_and_jpy_prices() {
 #[test]
 fn different_symbols_are_not_duplicate_quotes() {
     let p = path("isolation");
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
+    let mut r = Runtime::open(&p, rules()).unwrap();
     for (symbol, price) in [
         ("EURUSD", 1_100_000),
         ("GBPUSD", 1_300_000),
@@ -85,8 +81,8 @@ fn file_runtime(name: &str) -> (std::path::PathBuf, std::path::PathBuf, Runtime)
     let db = path(name);
     let file = db.with_extension("json");
     std::fs::write(&file, rules().to_string()).unwrap();
-    let mut r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
-    r.link(9, "EURUSD:s").unwrap();
+    let mut r = Runtime::open_file(&db, &file).unwrap();
+    r.link(9, "EURUSD:swing:trend:1:1767600000").unwrap();
     r.update(&json!({"update_id":1,"message":{"message_id":10,"chat":{"id":-1},"from":{"id":1},"text":"buffer","reply_to_message":{"message_id":9}}}),-1).unwrap();
     (db, file, r)
 }
@@ -95,7 +91,7 @@ fn change() -> forex_bot::protocols::Analysis {
         action: "apply".into(),
         explanation: "changed".into(),
         changes: vec![forex_bot::protocols::Change {
-            path: "/parameters/stop_buffer_atr/value".into(),
+            path: "/instruments/EURUSD/stop_buffer_atr".into(),
             value: json!(0.7),
         }],
     }
@@ -119,8 +115,8 @@ fn applied_change_is_in_json_and_never_in_snapshot_or_event_patch() {
     let (db, file, mut r) = file_runtime("apply");
     r.analysis(1, &change(), &json!({})).unwrap();
     drop(r);
-    let r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
-    assert_eq!(r.rules()["parameters"]["stop_buffer_atr"]["value"], 0.7);
+    let r = Runtime::open_file(&db, &file).unwrap();
+    assert_eq!(r.rules()["instruments"]["EURUSD"]["stop_buffer_atr"], 0.7);
     assert!(r.next_comment().is_none());
     let db = rusqlite::Connection::open(db).unwrap();
     let patch: String = db
@@ -135,9 +131,9 @@ fn corrupted_or_missing_file_never_falls_back_to_snapshot() {
     let (db, file, r) = file_runtime("invalid-file");
     drop(r);
     std::fs::write(&file, "broken").unwrap();
-    assert!(Runtime::open_file(&db, &file, Engine::default()).is_err());
+    assert!(Runtime::open_file(&db, &file).is_err());
     std::fs::remove_file(&file).unwrap();
-    assert!(Runtime::open_file(&db, &file, Engine::default()).is_err());
+    assert!(Runtime::open_file(&db, &file).is_err());
 }
 #[test]
 fn interruption_before_file_write_retains_comment() {
@@ -150,7 +146,7 @@ fn interruption_before_file_write_retains_comment() {
     snap["operation"] = json!({"id":1,"before":format!("{:x}",Sha256::digest(current.to_string().as_bytes())),"after":"not-written"});
     store.save_runtime(&snap).unwrap();
     drop(store);
-    let r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
+    let r = Runtime::open_file(&db, &file).unwrap();
     assert!(
         r.next_comment().is_some(),
         "unwritten change must remain queued"
@@ -162,7 +158,7 @@ fn interruption_after_file_write_uses_json_once_without_patch() {
     let before = r.rules();
     drop(r);
     let mut after = before.clone();
-    after["parameters"]["stop_buffer_atr"]["value"] = json!(0.7);
+    after["instruments"]["EURUSD"]["stop_buffer_atr"] = json!(0.7);
     use sha2::{Digest, Sha256};
     let hash = |v: &Value| format!("{:x}", Sha256::digest(v.to_string().as_bytes()));
     let mut store = Store::open(&db).unwrap();
@@ -171,12 +167,12 @@ fn interruption_after_file_write_uses_json_once_without_patch() {
     store.save_runtime(&snap).unwrap();
     drop(store);
     std::fs::write(&file, after.to_string()).unwrap();
-    let r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
+    let r = Runtime::open_file(&db, &file).unwrap();
     assert_eq!(r.rules(), after);
     assert!(r.next_comment().is_none());
     assert_eq!(r.pending().unwrap().len(), 1);
     drop(r);
-    let r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
+    let r = Runtime::open_file(&db, &file).unwrap();
     assert_eq!(r.pending().unwrap().len(), 1);
 }
 #[test]
@@ -189,176 +185,146 @@ fn previous_database_is_not_rewritten_on_open() {
     assert!(forex_bot::data::open(&p).is_err());
     assert_eq!(std::fs::read(&p).unwrap(), before);
 }
+fn active_swing(config: &Value, entry: f64, stop: f64, tp: f64) -> forex_core::swing::Swing {
+    let swing = forex_core::swing::Swing::new(serde_json::from_value(config.clone()).unwrap());
+    let mut saved = serde_json::to_value(swing).unwrap();
+    saved["trades"] = json!([{
+        "kind":"Trend", "dir":1, "entry":entry, "stop":stop, "tp":tp,
+        "rr":(tp-entry)/(entry-stop), "signal_t":1_767_600_000, "fill_t":1_767_600_000,
+        "entry_kind":"market", "state":"Active", "r":null, "exit_t":null,
+        "plan":null, "range_box":null
+    }]);
+    serde_json::from_value(saved).unwrap()
+}
 #[test]
 fn quotes_only_track_their_instrument_and_repeat_safely_after_restart() {
-    use forex_bot::trading::{Quote, Side, Signal};
     let p = path("separate-signals");
-    let cfg = serde_json::from_value(rules()).unwrap();
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
-    for symbol in ["EURUSD", "GBPUSD", "USDJPY"] {
-        let signal = Signal::new(
-            "same",
-            Side::Long,
-            Quote {
-                time: 1,
-                price: 10000,
-            },
-            9000,
-            15000,
-            1,
-            &cfg,
-        )
+    let v = rules();
+    let mut r = Runtime::open(&p, v.clone()).unwrap();
+    for (symbol, entry, stop, tp) in [
+        ("EURUSD", 1.1, 1.09, 1.13),
+        ("GBPUSD", 1.3, 1.29, 1.33),
+        ("USDJPY", 153.0, 152.0, 155.0),
+    ] {
+        let config = v["instruments"][symbol].clone();
+        r.swing(symbol, config.clone(), || {
+            Ok(active_swing(&config, entry, stop, tp))
+        })
         .unwrap();
-        let mut e = serde_json::to_value(Engine::default()).unwrap();
-        e["signals"] = json!([signal]);
-        r.seed_instrument(symbol, serde_json::from_value(e).unwrap())
+        r.tick(fixture_tick(symbol, (entry * 1_000_000.0) as i64), false)
             .unwrap();
-        let t = forex_bot::feed::Tick {
-            symbol: symbol.into(),
-            millis: 2000,
-            price: 10000,
-
-            source: "upscale:index".into(),
-        };
-        r.tick(t, false).unwrap();
     }
-    let t = forex_bot::feed::Tick {
-        symbol: "USDJPY".into(),
-        millis: 3000,
-        price: 8900,
-
-        source: "upscale:index".into(),
-    };
-    r.tick(t.clone(), false).unwrap();
-    assert_eq!(r.signal_context("USDJPY:same")["state"], "Stop");
-    assert_eq!(r.signal_context("EURUSD:same")["state"], "Active");
-    assert_eq!(r.signal_context("GBPUSD:same")["state"], "Active");
-    let n = r.pending().unwrap().len();
-    drop(r);
-    let mut r = Runtime::open(&p, rules(), Engine::default()).unwrap();
-    r.tick(t, false).unwrap();
-    assert_eq!(r.pending().unwrap().len(), n);
-    assert!(r
-        .pending()
-        .unwrap()
+    let mut stop = fixture_tick("USDJPY", 151_900_000);
+    stop.millis += 1000;
+    r.tick(stop.clone(), false).unwrap();
+    assert!(r.swing_rules("USDJPY").unwrap().trades().is_empty());
+    for symbol in ["EURUSD", "GBPUSD"] {
+        assert_eq!(
+            r.signal_context(&format!("{symbol}:swing:trend:1:1767600000"))["trade"]["state"],
+            "Active"
+        );
+    }
+    let pending = r.pending().unwrap();
+    let stopped: Vec<_> = pending
         .iter()
-        .any(|m| m.payload["text"].as_str().unwrap().contains("USD/JPY")));
+        .filter(|m| m.payload["text"].as_str().unwrap().contains("Стоп"))
+        .collect();
+    assert_eq!(stopped.len(), 1);
+    assert!(stopped[0].payload["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("USD/JPY"));
+    drop(r);
+    let mut r = Runtime::open(&p, rules()).unwrap();
+    r.tick(stop, false).unwrap();
+    let after = r.pending().unwrap();
+    assert_eq!(after.len(), pending.len());
+    for (expected, actual) in pending.iter().zip(after) {
+        assert_eq!(actual.id, expected.id);
+        assert_eq!(actual.payload, expected.payload);
+    }
 }
 #[test]
-fn symbols_are_configurable_but_malformed_duplicates_and_bad_ticks_fail() {
+fn symbols_are_configurable_but_malformed_names_and_unknown_tick_symbols_fail() {
     let mut v = rules();
-    v["instruments"][0]["symbol"] = json!("AUDCAD");
+    let config = v["instruments"]
+        .as_object_mut()
+        .unwrap()
+        .remove("EURUSD")
+        .unwrap();
+    v["instruments"]["AUDCAD"] = config.clone();
     assert!(forex_bot::validate(&serde_json::from_value(v.clone()).unwrap()).is_ok());
-    for bad in [json!("audcad"), json!("../ABC"), json!("AUD")] {
+    for bad in ["audcad", "../ABC", "AUD"] {
         let mut b = v.clone();
-        b["instruments"][0]["symbol"] = bad;
+        b["instruments"].as_object_mut().unwrap().remove("AUDCAD");
+        b["instruments"][bad] = config.clone();
         assert!(forex_bot::validate(&serde_json::from_value(b).unwrap()).is_err());
     }
-    for tick in [0, -1] {
-        let mut b = v.clone();
-        b["instruments"][0]["price_tick"] = json!(tick);
-        assert!(forex_bot::validate(&serde_json::from_value(b).unwrap()).is_err());
-    }
-    v["instruments"][1] = v["instruments"][0].clone();
-    assert!(forex_bot::validate(&serde_json::from_value(v).unwrap()).is_err());
+    let mut empty = v.clone();
+    empty["instruments"] = json!({});
+    assert!(forex_bot::validate(&serde_json::from_value(empty).unwrap()).is_err());
+    let mut r = Runtime::open(&path("unknown-symbol"), v).unwrap();
+    assert!(r.tick(fixture_tick("EURUSD", 1_100_000), false).is_err());
+    r.tick(fixture_tick("AUDCAD", 900_000), false).unwrap();
 }
 #[test]
-fn telegram_rule_change_preserves_published_levels_for_all_pairs() {
-    use forex_bot::{
-        engine::Timeframe,
-        trading::{Candle, Quote, Side, Zone, ZoneKind},
-    };
+fn telegram_rule_change_preserves_published_levels_and_other_pair_contexts() {
     let db = path("all-rules");
     let file = db.with_extension("json");
-    let mut v = rules();
-    v["parameters"]["atr_period"]["value"] = json!(1);
-    for tf in ["W", "D", "H4"] {
-        v["context"]["minimum_bars"][tf] = json!(1);
-    }
+    let v = rules();
     std::fs::write(&file, v.to_string()).unwrap();
-    let cfg = serde_json::from_value(v).unwrap();
-    let mut r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
+    let mut r = Runtime::open_file(&db, &file).unwrap();
     let mut originals = Vec::new();
-    for (symbol, scale, tick) in [
-        ("EURUSD", 10000, 1),
-        ("GBPUSD", 10000, 10),
-        ("USDJPY", 1000000, 1000),
+    for (symbol, entry, stop, tp) in [
+        ("EURUSD", 1.1, 1.09, 1.13),
+        ("GBPUSD", 1.3, 1.29, 1.33),
+        ("USDJPY", 153.0, 152.0, 155.0),
     ] {
-        let mut e = Engine::default();
-        let bar = |end, o, h, l, c| Candle {
-            end,
-            open: o * scale,
-            high: h * scale,
-            low: l * scale,
-            close: c * scale,
-        };
-        for b in [
-            bar(1, 280, 300, 270, 280),
-            bar(2, 280, 310, 270, 280),
-            bar(3, 280, 300, 270, 280),
-        ] {
-            e.seed(Timeframe::D, b, &cfg).unwrap();
-        }
-        for t in 1..=10 {
-            e.seed(Timeframe::H4, bar(t, 100, 110, 90, 100), &cfg)
-                .unwrap();
-        }
-        e.add_plan(
-            "D_correction_end",
-            Side::Long,
-            Timeframe::D,
-            Zone::new(Side::Long, 90 * scale, 100 * scale, 1, ZoneKind::Fvg),
-            10,
-        );
-        e.closed(Timeframe::H4, bar(11, 125, 140, 120, 130), &cfg)
-            .unwrap();
-        e.quote(
-            Quote {
-                time: 12,
-                price: 130 * scale,
-            },
-            tick,
-            &cfg,
-        )
+        let config = v["instruments"][symbol].clone();
+        r.swing(symbol, config.clone(), || {
+            Ok(active_swing(&config, entry, stop, tp))
+        })
         .unwrap();
-        e.namespace_signals(symbol);
-        assert_eq!(e.signals().len(), 1);
-        originals.push((e.signals()[0].id.clone(), e.signals()[0].stop, tick));
-        r.seed_instrument(symbol, e).unwrap();
+        let id = format!("{symbol}:swing:trend:1:1767600000");
+        originals.push((id.clone(), r.signal_context(&id)));
     }
     r.link(9, &originals[0].0).unwrap();
     r.update(&json!({"update_id":1,"message":{"message_id":10,"chat":{"id":-1},"from":{"id":1},"text":"buffer","reply_to_message":{"message_id":9}}}),-1).unwrap();
     r.analysis(1, &change(), &json!({})).unwrap();
-    let out = r.pending().unwrap();
-    let revisions: Vec<_> = out
-        .iter()
-        .filter(|m| m.payload.get("revision").is_some())
-        .collect();
-    assert!(revisions.is_empty());
-    for (id, stop, _) in &originals {
-        assert_eq!(r.signal_context(id)["stop"], *stop);
+    let revised = r.rules()["instruments"]["EURUSD"].clone();
+    r.swing("EURUSD", revised.clone(), || {
+        Ok(forex_core::swing::Swing::new(
+            serde_json::from_value(revised).unwrap(),
+        ))
+    })
+    .unwrap();
+    for symbol in ["GBPUSD", "USDJPY"] {
+        r.swing(symbol, v["instruments"][symbol].clone(), || {
+            Err("unchanged pair must not restart".into())
+        })
+        .unwrap();
     }
-    for m in out {
-        r.delivered(&m.id, 100 + r.offset()).unwrap();
+    let out = r.pending().unwrap();
+    assert_eq!(
+        out.len(),
+        4,
+        "three original trades and one analysis reply only"
+    );
+    assert!(out.iter().all(|m| m.payload.get("revision").is_none()));
+    for (id, context) in &originals {
+        assert_eq!(r.signal_context(id), *context);
     }
     drop(r);
-    let r = Runtime::open_file(&db, &file, Engine::default()).unwrap();
-    for (id, stop, _) in originals {
-        assert_eq!(r.signal_context(&id)["stop"], stop);
+    let r = Runtime::open_file(&db, &file).unwrap();
+    for (id, context) in originals {
+        assert_eq!(r.signal_context(&id), context);
     }
+    assert_eq!(r.pending().unwrap().len(), 4);
 }
-
-fn display_signal(id: &str) -> forex_bot::trading::Signal {
-    serde_json::from_value(json!({
-        "id": id, "side": "Long", "state": "Active", "entry": 1100000,
-        "stop": 1090000, "target": 1130000, "take_profit": 1130000,
-        "last_quote_time": 1
-    }))
-    .unwrap()
-}
-
 #[test]
-fn signal_message_uses_its_actual_pair() {
+fn swing_message_uses_its_actual_pair() {
+    let v = rules();
+    let swing = active_swing(&v["instruments"]["EURUSD"], 1.1, 1.09, 1.13);
     for (symbol, label) in [
         ("EURUSD", "EUR/USD"),
         ("GBPUSD", "GBP/USD"),
@@ -366,26 +332,7 @@ fn signal_message_uses_its_actual_pair() {
         ("AUDCAD", "AUD/CAD"),
     ] {
         let text =
-            forex_bot::runtime::signal_text(&display_signal(&format!("{symbol}:setup"))).unwrap();
+            forex_bot::runtime::swing_text(symbol, &swing.trades()[0], "Сделка открыта", None);
         assert!(text.starts_with(label));
-    }
-}
-
-#[test]
-fn signal_message_never_invents_eurusd_for_unknown_pair() {
-    for id in [
-        "setup",
-        "",
-        ":setup",
-        "gbpusd:setup",
-        "USD:setup",
-        "АБВГДЕ:setup",
-    ] {
-        let text = forex_bot::runtime::signal_text(&display_signal(id));
-        assert_eq!(
-            text.unwrap_err(),
-            "Не удалось определить пару сигнала: отсутствует или некорректен префикс ID",
-            "{id:?}"
-        );
     }
 }

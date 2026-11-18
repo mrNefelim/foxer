@@ -13,7 +13,6 @@ __pycache__/
 .env.*
 !.env.example
 
-/strategy/fvg-bot-rules.json
 logogroup.png
 
 # Publish the schema example, not local databases or datasets.

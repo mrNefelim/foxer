@@ -1,6 +1,6 @@
 use forex_core::{
-    engine::Timeframe,
     feed::{Aggregator, Tick},
+    market::Timeframe,
     prices::{utc, Minute},
 };
 fn m(t: i64, gap: u64) -> Minute {
@@ -18,7 +18,7 @@ fn week(a: &mut Aggregator, from: &str, to: &str) {
         t += 60;
     }
 }
-fn tfs(closed: &[(Timeframe, forex_core::trading::Candle)]) -> Vec<Timeframe> {
+fn tfs(closed: &[(Timeframe, forex_core::market::Candle)]) -> Vec<Timeframe> {
     closed.iter().map(|(tf, _)| *tf).collect()
 }
 #[test]

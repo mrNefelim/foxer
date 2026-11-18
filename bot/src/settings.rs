@@ -13,7 +13,6 @@ pub struct Settings {
     pub database: PathBuf,
     pub strategy: PathBuf,
     pub stale_seconds: i64,
-    pub swing_strategy: Option<PathBuf>,
 }
 impl Settings {
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -29,9 +28,7 @@ impl Settings {
             "DATABASE_PATH",
             "STRATEGY_PATH",
             "QUOTE_STALE_SECONDS",
-            "PRICE_TICK",
             "UPSCALE_API_KEY",
-            "SWING_STRATEGY",
         ];
         let mut values = BTreeMap::new();
         for line in text
@@ -61,9 +58,7 @@ impl Settings {
             }
         }
         for name in names {
-            if !matches!(name, "PRICE_TICK" | "UPSCALE_API_KEY" | "SWING_STRATEGY")
-                && !values.contains_key(name)
-            {
+            if !matches!(name, "UPSCALE_API_KEY") && !values.contains_key(name) {
                 return Err(format!("missing setting: {name}"));
             }
         }
@@ -74,9 +69,6 @@ impl Settings {
         };
         let chat = number("TELEGRAM_CHAT_ID")?;
         let stale_seconds = number("QUOTE_STALE_SECONDS")?;
-        if values.contains_key("PRICE_TICK") && number("PRICE_TICK")? <= 0 {
-            return Err("invalid legacy PRICE_TICK".into());
-        }
         let max_tokens =
             u32::try_from(number("OPENAI_MAX_TOKENS")?).map_err(|_| "invalid OPENAI_MAX_TOKENS")?;
         if chat == 0 || stale_seconds <= 0 || max_tokens == 0 {
@@ -92,7 +84,6 @@ impl Settings {
             database: values["DATABASE_PATH"].into(),
             strategy: values["STRATEGY_PATH"].into(),
             stale_seconds,
-            swing_strategy: values.get("SWING_STRATEGY").map(PathBuf::from),
         })
     }
 }

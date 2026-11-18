@@ -1,11 +1,9 @@
 use crate::{
-    engine::Engine,
     feed::{Aggregator, Tick},
     model::Strategy,
     protocols::{self, Analysis, Comment},
     state::{Entity, Kind, Outbound, Store},
     swing::{Kind as SwingKind, Swing, SwingConfig, Trade as SwingTrade, TradeState},
-    trading::{Side, Signal},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -29,6 +27,9 @@ struct Snapshot {
     texts: BTreeMap<i64, String>,
     #[serde(default)]
     reply_context: BTreeMap<i64, String>,
+    /// Last published state, retained after Swing drains a completed trade.
+    #[serde(default)]
+    swing_context: BTreeMap<String, Value>,
     offset: i64,
     queue: VecDeque<Comment>,
     api_down: bool,
@@ -37,7 +38,6 @@ struct Snapshot {
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct Market {
-    engine: Engine,
     aggregator: Aggregator,
     feed_down: bool,
     #[serde(default)]
@@ -168,6 +168,7 @@ struct SwingAdvanceContext<'a> {
     bars: &'a [(crate::swing::Tf, crate::swing::Bar)],
     external_open_positions: usize,
     messages: &'a mut Vec<Outbound>,
+    signal_context: &'a mut BTreeMap<String, Value>,
 }
 fn advance_swing(
     rules: &mut Swing,
@@ -181,6 +182,7 @@ fn advance_swing(
         bars,
         external_open_positions,
         messages,
+        signal_context,
     } = context;
     let symbol = tick.symbol.as_str();
     let now = crate::swing::grid_time(tick.millis / 1000);
@@ -240,6 +242,10 @@ fn advance_swing(
                 Some(&key),
                 None,
             ));
+            signal_context.insert(
+                key.clone(),
+                json!({"id":key,"symbol":symbol,"trade":trade,"config":config}),
+            );
         }
         if matches!(trade.state, TradeState::Pending | TradeState::Active) {
             published.insert(key, event.to_owned());
@@ -255,89 +261,6 @@ fn open_swing_positions(rules: &Swing) -> usize {
         .iter()
         .filter(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
         .count()
-}
-pub fn signal_text(s: &Signal) -> Result<String, String> {
-    let symbol =
-        s.id.split_once(':')
-            .filter(|(symbol, _)| crate::valid_symbol(symbol))
-            .map(|(symbol, _)| symbol)
-            .ok_or("Не удалось определить пару сигнала: отсутствует или некорректен префикс ID")?;
-    let pair = format!("{}/{}", &symbol[..3], &symbol[3..]);
-    let side = if s.side == Side::Long {
-        "покупка"
-    } else {
-        "продажа"
-    };
-    let risk = (s.entry as f64 - s.stop as f64).abs();
-    let rr = (s.take_profit as f64 - s.entry as f64).abs() / risk;
-    let p = |n: i64| format!("{}.{:06}", n / 1_000_000, n % 1_000_000);
-    let when = chrono::DateTime::from_timestamp(s.last_quote_time, 0)
-        .map(|t| t.to_rfc3339())
-        .unwrap_or_default();
-    Ok(format!("{pair} · {side}\n{when}\nВход {} · стоп {} · цель {} · RR {rr:.2}\nСостояние {:?}\nПравило {}",p(s.entry),p(s.stop),p(s.take_profit),s.state,s.id.split(':').find(|part| !crate::valid_symbol(part)).unwrap_or("")))
-}
-fn waiting_condition_text(symbol: &str, condition: &Value) -> String {
-    let id = condition["id"].as_str().unwrap_or("unknown-plan");
-    let rule = condition["rule"].as_str().unwrap_or("plan");
-    let status = match condition["status"].as_str() {
-        Some("wait_confirm") => "ожидает подтверждения",
-        Some("wait_entry") => "ожидает новую входную зону H4",
-        _ => "ожидание пересчитано",
-    };
-    let poi_tf = condition["poi_timeframe"].as_str().unwrap_or("?");
-    let side = match condition["side"].as_str() {
-        Some("Long") => "покупка",
-        Some("Short") => "продажа",
-        _ => "неизвестное направление",
-    };
-    let low = condition["poi"]["low"].as_i64().unwrap_or_default();
-    let high = condition["poi"]["high"].as_i64().unwrap_or_default();
-    let price = |n: i64| format!("{}.{:06}", n / 1_000_000, n % 1_000_000);
-    let started = condition["started"]
-        .as_i64()
-        .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
-        .map(|t| t.to_rfc3339())
-        .unwrap_or_else(|| "неизвестно".into());
-    let mut text = format!(
-        "Условия плана {id} после изменения правил\n{symbol} · {side} · {rule}\nСостояние: {status}\nPOI {poi_tf}: {}–{}\nПлан начат: {started}",
-        price(low),
-        price(high)
-    )
-    ;
-    if condition["status"] == "wait_confirm" {
-        let window = condition["confirmation_window_h4"]
-            .as_u64()
-            .unwrap_or_default();
-        text.push_str(&format!(
-            "\nПодтверждение: FVG по направлению плана либо инверсия встречной зоны; окно инверсии — {window} H4"
-        ));
-    } else {
-        if let Some(zone) = condition["entry_zone"].as_object() {
-            let low = zone.get("low").and_then(Value::as_i64).unwrap_or_default();
-            let high = zone.get("high").and_then(Value::as_i64).unwrap_or_default();
-            text.push_str(&format!(
-                "\nВходная зона H4: {}–{}",
-                price(low),
-                price(high)
-            ));
-        } else {
-            text.push_str("\nВходная зона H4: ожидается");
-        }
-        let rr_min = condition["rr_min"].as_f64().unwrap_or_default();
-        let stop_buffer = condition["stop_buffer_atr"].as_f64().unwrap_or_default();
-        text.push_str(&format!(
-            "\nУсловия входа: RR min {rr_min}; запас стопа {stop_buffer} ATR"
-        ));
-        if condition["entry_session_filter"].as_bool() == Some(true) {
-            text.push_str(&format!(
-                "; часы закрытия H4 {:?}",
-                condition["entry_h4_close_hours"]
-            ));
-        } else {
-            text.push_str("; фильтр часов закрытия H4 выключен");
-        }
-    }
-    text
 }
 impl Runtime {
     pub fn started(&mut self, time: i64) -> Result<(), String> {
@@ -382,8 +305,8 @@ impl Runtime {
                         .map(|t| t.to_rfc3339())
                         .unwrap_or_else(|| "нет".into());
                     format!(
-                        "{symbol}: Работаю; последняя котировка: {last}; ожидающих планов: {}",
-                        m.engine.waiting_count()
+                        "{symbol}: Работаю; последняя котировка: {last}; открытых Swing-позиций: {}",
+                        m.swing.as_ref().map_or(0, |sw| open_swing_positions(&sw.rules) + sw.retired.iter().map(|old| open_swing_positions(&old.rules)).sum::<usize>())
                     )
                 })
                 .collect::<Vec<_>>()
@@ -394,7 +317,7 @@ impl Runtime {
         json!({"signal":self.signal_context(&c.signal_id),"replied_message":self.s.reply_context.get(&c.update_id)})
     }
 
-    pub fn open(path: &Path, rules: Value, engine: Engine) -> Result<Self, String> {
+    pub fn open(path: &Path, rules: Value) -> Result<Self, String> {
         let c: Strategy =
             serde_json::from_value(rules.clone()).map_err(|_| "invalid rules JSON")?;
         crate::validate(&c)?;
@@ -409,13 +332,14 @@ impl Runtime {
         } else {
             Snapshot {
                 calendar_version: 4,
-                hash_version: 2,
+                hash_version: 3,
                 markets: BTreeMap::new(),
                 rules_hash: rules_hash.clone(),
                 operation: None,
                 known: BTreeMap::new(),
                 texts: BTreeMap::new(),
                 reply_context: BTreeMap::new(),
+                swing_context: BTreeMap::new(),
                 offset: 0,
                 queue: VecDeque::new(),
                 api_down: false,
@@ -426,59 +350,35 @@ impl Runtime {
         for market in s.markets.values_mut() {
             if let Some(swing) = market.swing.as_mut() {
                 swing.rules.normalize_legacy_entry_kinds();
-            }
-        }
-        if s.hash_version > 2 {
-            return Err("unsupported runtime hash version".into());
-        }
-        if s.hash_version != 2 && s.operation.is_some() {
-            return Err("unfinished legacy rule operation; restore with the previous application before upgrading".into());
-        }
-        let changed = s.hash_version != 2 || s.rules_hash != rules_hash;
-        let old_calendar = s.calendar_version != 4;
-        let mut recovery_messages = vec![];
-        for item in &c.instruments {
-            let m = s
-                .markets
-                .entry(item.symbol.clone())
-                .or_insert_with(|| Market {
-                    engine: if item.symbol == "EURUSD" {
-                        engine.clone()
-                    } else {
-                        Engine::default()
-                    },
-                    ..Market::default()
-                });
-            m.aggregator.disconnected();
-            if old_calendar {
-                m.engine.infer_legacy_entries();
-                let context = crate::service::history_engine(path, &c, &item.symbol)?;
-                m.engine.replace_context(context);
-                m.aggregator = Aggregator::default();
-            }
-            if changed && !old_calendar {
-                for revised in m.engine.reconfigure(&c, item.price_tick)? {
-                    let mut out = message(
-                        format!("reconfigure:{}:{}", hash(&rules), revised.id),
-                        format!("Требует изменения\n{}", signal_text(&revised)?),
-                        Some(&revised.id),
-                        None,
-                    );
-                    out.payload["revision"] = value(&revised)?;
-                    out.payload["symbol"] = json!(item.symbol);
-                    recovery_messages.push(out);
+                for retired in &mut swing.retired {
+                    retired.rules.normalize_legacy_entry_kinds();
                 }
             }
         }
-        for (symbol, m) in &s.markets {
-            if !c.instruments.iter().any(|i| &i.symbol == symbol)
-                && (!m.engine.signals().is_empty() || m.engine.waiting_count() > 0)
-            {
-                return Err("cannot remove instrument with plans or signals".into());
+        if s.hash_version > 3 {
+            return Err("unsupported runtime hash version".into());
+        }
+        if s.hash_version != 3 && s.operation.is_some() {
+            return Err("unfinished legacy rule operation; restore with the previous application before upgrading".into());
+        }
+        if s.calendar_version != 4 {
+            return Err("unsupported runtime calendar version".into());
+        }
+        let mut recovery_messages = vec![];
+        for symbol in c.instruments.keys() {
+            s.markets.entry(symbol.clone()).or_default();
+        }
+        for (symbol, market) in &mut s.markets {
+            market.aggregator.disconnected();
+            if !c.instruments.contains_key(symbol) {
+                if let Some(swing) = &mut market.swing {
+                    swing.enabled = false;
+                    swing.rules.stop_new_plans();
+                }
             }
         }
         s.markets
-            .retain(|symbol, _| c.instruments.iter().any(|i| &i.symbol == symbol));
+            .retain(|symbol, market| c.instruments.contains_key(symbol) || market.swing.is_some());
         // A staged operation contains hashes only. Never apply its old patch on recovery.
         if let Some(op) = s.operation.take() {
             if hash(&rules) != op.before && s.queue.front().is_some_and(|c| c.update_id == op.id) {
@@ -498,7 +398,7 @@ impl Runtime {
         }
         s.calendar_version = 4;
         s.rules_hash = rules_hash;
-        s.hash_version = 2;
+        s.hash_version = 3;
         if recovery_messages.is_empty() {
             store.save_runtime(&value(&s)?)?;
         } else {
@@ -524,21 +424,15 @@ impl Runtime {
             startup_announced: false,
         })
     }
-    pub fn open_file(path: &Path, file: &Path, engine: Engine) -> Result<Self, String> {
+    pub fn open_file(path: &Path, file: &Path) -> Result<Self, String> {
         let rules = forex_core::load_document(file)?;
-        let mut r = Self::open(path, rules, engine)?;
+        let mut r = Self::open(path, rules)?;
         r.rules_path = Some(file.to_owned());
         Ok(r)
     }
-    pub fn seed_instrument(&mut self, symbol: &str, engine: Engine) -> Result<(), String> {
-        let m = self.s.markets.get_mut(symbol).ok_or("unknown instrument")?;
-        if m.aggregator.last_quote_millis().is_none()
-            && m.engine.waiting_count() == 0
-            && m.engine.signals().is_empty()
-        {
-            m.engine = engine;
-        }
-        self.store.save_runtime(&value(&self.s)?)
+    /// Includes removed instruments while their saved Swing state is monitored.
+    pub fn symbols(&self) -> Vec<String> {
+        self.s.markets.keys().cloned().collect()
     }
     fn commit(
         &mut self,
@@ -640,13 +534,22 @@ impl Runtime {
         self.rules.clone()
     }
     pub fn signal_context(&self, id: &str) -> Value {
-        self.s
-            .markets
-            .values()
-            .flat_map(|m| m.engine.signals())
-            .find(|s| s.id == id)
-            .and_then(|s| value(&s).ok())
-            .unwrap_or(Value::Null)
+        for (symbol, market) in &self.s.markets {
+            if let Some(swing) = &market.swing {
+                for (config, rules) in std::iter::once((&swing.config, &swing.rules))
+                    .chain(swing.retired.iter().map(|old| (&old.config, &old.rules)))
+                {
+                    if let Some(trade) = rules
+                        .trades()
+                        .iter()
+                        .find(|trade| swing_id(symbol, trade) == id)
+                    {
+                        return json!({"id":id,"symbol":symbol,"trade":trade,"config":config});
+                    }
+                }
+            }
+        }
+        self.s.swing_context.get(id).cloned().unwrap_or(Value::Null)
     }
     pub fn analysis(&mut self, id: i64, a: &Analysis, usage: &Value) -> Result<(), String> {
         let comment = self
@@ -660,30 +563,17 @@ impl Runtime {
         let mut messages = vec![];
         let mut explanation = a.explanation.clone();
         let mut next_rules = self.rules.clone();
-        match protocols::apply_changes(&self.rules,a) {
+        let candidate = if !comment.signal_id.contains(":swing:") {
+            explanation =
+                "Этот сигнал относится к удалённой стратегии FVG. Правила Swing не изменены."
+                    .into();
+            Ok(self.rules.clone())
+        } else {
+            protocols::apply_changes(&self.rules, a)
+        };
+        match candidate {
             Ok(rules) if rules!=self.rules => {
-                let c:Strategy=serde_json::from_value(rules.clone()).map_err(|_|"invalid changed rules")?;
                 let next_hash=calculation_hash(&rules)?;
-                if next_hash != s.rules_hash {
-                for item in &c.instruments {
-                    let m=s.markets.get_mut(&item.symbol).ok_or("unknown instrument")?;
-                    for revised in m.engine.reconfigure(&c,item.price_tick)? {
-                        let mut out=message(format!("revision:{id}:{}",revised.id),format!("Требует изменения\n{}",signal_text(&revised)?),Some(&revised.id),None);
-                        out.payload["revision"]=value(&revised)?;
-                        out.payload["symbol"]=json!(item.symbol);
-                        messages.push(out);
-                    }
-                    for condition in m.engine.waiting_conditions(&c) {
-                        let id = condition["id"].as_str().ok_or("waiting plan has no ID")?;
-                        messages.push(message(
-                            format!("conditions:{}:{}:{id}", comment.update_id, item.symbol),
-                            waiting_condition_text(&item.symbol, &condition),
-                            Some(&comment.signal_id),
-                            Some(comment.message_id),
-                        ));
-                    }
-                }
-                }
                 let file=self.rules_path.as_ref().ok_or("rules file is required for changes")?;
                 let op=RuleOperation{id,before:hash(&self.rules),after:hash(&rules)};
                 let mut staged=self.s.clone();staged.operation=Some(op);
@@ -783,43 +673,12 @@ impl Runtime {
         let mut s = self.s.clone();
         let symbol = t.symbol.clone();
         let m = s.markets.get_mut(&symbol).ok_or("unknown instrument")?;
-        let before = m.engine.signals();
         let mut messages = vec![];
-        let cfg: Strategy =
-            serde_json::from_value(self.rules.clone()).map_err(|_| "invalid stored rules")?;
-        let batch =
-            crate::processing::process(&mut m.engine, &mut m.aggregator, &t, &cfg, allow_new)?;
-        let h4_end = batch
-            .bars
+        let all_bars = m.aggregator.push_all(t.clone())?;
+        let h4_end = all_bars
             .iter()
-            .find(|(tf, _)| *tf == crate::engine::Timeframe::H4)
-            .map(|(_, b)| b.end);
-        for (previous, current) in batch.weekly {
-            let rule = match (previous, current) {
-                (None, Some(_)) => "W_trend_new",
-                (Some(_), None) => "W_trend_end",
-                _ => "W_trend_flip",
-            };
-            let description = match rule {
-                "W_trend_new" => &cfg.messages.w_trend_new,
-                "W_trend_end" => &cfg.messages.w_trend_end,
-                _ => &cfg.messages.w_trend_flip,
-            };
-            let direction = match current {
-                Some(Side::Long) => "↑",
-                Some(Side::Short) => "↓",
-                None => "нет направления",
-            };
-            messages.push(message(
-                format!("{id}:{rule}"),
-                format!(
-                    "{symbol}: {rule}: {}",
-                    description.replace("↑/↓", direction)
-                ),
-                None,
-                None,
-            ));
-        }
+            .find(|(tf, _, complete)| *complete && *tf == crate::market::Timeframe::H4)
+            .map(|(_, bar, _)| bar.end);
         if m.feed_down {
             m.feed_down = false;
             messages.push(message(
@@ -830,7 +689,7 @@ impl Runtime {
             ));
         }
         if let Some(sw) = m.swing.as_mut() {
-            let bars = crate::swing::rules_bars(&batch.all_bars);
+            let bars = crate::swing::rules_bars(&all_bars);
             // Snapshot occupancy before processing any exits in this tick. This
             // makes admission conservative when a trade exits on the same minute.
             let current_at_start = open_swing_positions(&sw.rules);
@@ -850,6 +709,7 @@ impl Runtime {
                     bars: &bars,
                     external_open_positions: retired_total,
                     messages: &mut messages,
+                    signal_context: &mut s.swing_context,
                 },
             )?;
             let current_reserved = current_at_start.max(open_swing_positions(&sw.rules));
@@ -870,6 +730,7 @@ impl Runtime {
                         bars: &bars,
                         external_open_positions: current_reserved + other_retired,
                         messages: &mut messages,
+                        signal_context: &mut s.swing_context,
                     },
                 )?;
             }
@@ -881,33 +742,20 @@ impl Runtime {
                     .any(|trade| matches!(trade.state, TradeState::Pending | TradeState::Active))
             });
         }
-        m.engine.namespace_signals(&symbol);
-        for signal in m.engine.signals() {
-            if m.swing.as_ref().is_some_and(|sw| sw.enabled) {
-                break;
-            }
-            let previous = before.iter().find(|p| p.id == signal.id);
-            if previous.is_none() || previous.is_some_and(|p| p.state != signal.state) {
-                messages.push(message(
-                    format!("{id}:{}", signal.id),
-                    signal_text(&signal)?,
-                    Some(&signal.id),
-                    None,
-                ));
-            }
-        }
         let mut logs = Vec::new();
         if let Some(end) = h4_end.filter(|_| allow_new) {
-            let found = m
-                .engine
-                .signals()
+            let found = messages
                 .iter()
-                .filter(|signal| !before.iter().any(|old| old.id == signal.id))
+                .filter(|out| {
+                    out.payload["text"].as_str().is_some_and(|text| {
+                        text.contains("Сделка открыта") || text.contains("Лимитная заявка")
+                    })
+                })
                 .count();
             let result = if found > 0 {
                 format!("новых сигналов: {found}")
             } else {
-                format!("новых сигналов нет: {}", m.engine.search_status(&cfg))
+                "новых сигналов нет".into()
             };
             let time = chrono::DateTime::from_timestamp(end, 0)
                 .ok_or("invalid H4 close time")?
@@ -1045,7 +893,7 @@ impl Runtime {
         });
         self.commit(&tag, json!({"symbol":symbol,"swing":config}), s, messages)
     }
-    /// Reconcile attached swing rules with the current optional rules file.
+    /// Reconcile attached swing rules with the current main rules document.
     /// Existing Pending/Active trades remain attached for monitoring.
     pub fn reconcile_swing(
         &mut self,

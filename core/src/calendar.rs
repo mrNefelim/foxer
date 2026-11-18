@@ -1,5 +1,5 @@
 //! Shared wall-clock candle boundaries. UTC is used for storage and event ordering.
-use crate::engine::Timeframe;
+use crate::market::Timeframe;
 use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
 use chrono_tz::America::New_York;
 
@@ -45,16 +45,6 @@ pub fn bounds(timestamp: i64, tf: Timeframe) -> Result<(i64, i64), String> {
         .ok_or("missing candle end")?;
     Ok((*start, *end))
 }
-pub fn entry_window(started: i64, policy: &str) -> Result<i64, String> {
-    match policy {
-        "plan_start_minus_24h" => started.checked_sub(86400).ok_or("time overflow".into()),
-        "plan_day_open" => {
-            bounds(started.checked_sub(1).ok_or("time overflow")?, Timeframe::D).map(|b| b.0)
-        }
-        _ => Err("unsupported entry window".into()),
-    }
-}
-
 /// Wall-clock hour (America/New_York) of a candle close.
 pub fn close_hour(end: i64) -> Result<u64, String> {
     let utc = Utc

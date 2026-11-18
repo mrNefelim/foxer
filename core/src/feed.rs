@@ -1,4 +1,4 @@
-use crate::{engine::Timeframe, trading::Candle};
+use crate::{market::Candle, market::Timeframe};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,7 +33,7 @@ impl Aggregator {
         self.last.as_ref().map(|t| t.millis)
     }
 
-    /// Closed complete bars (for the main engine).
+    /// Closed complete bars.
     pub fn push(&mut self, t: Tick) -> Result<Vec<(Timeframe, Candle)>, String> {
         Ok(complete(self.push_all(t)?))
     }
@@ -109,7 +109,7 @@ impl Aggregator {
         self.last = Some(t);
         Ok(closed)
     }
-    /// Closed complete bars after a prepared minute (for the main engine).
+    /// Closed complete bars after a prepared minute.
     pub fn minute(
         &mut self,
         symbol: &str,

@@ -162,7 +162,16 @@ pub fn bucket(timestamp: i64, seconds: i64, anchor: i64) -> i64 {
     (timestamp - anchor).div_euclid(seconds) * seconds + anchor
 }
 pub fn inspect(path: &Path, as_of: &str, strategy: &crate::model::Strategy) -> Result<Value> {
-    inspect_symbol(path, as_of, strategy, "EURUSD")
+    let symbol = if strategy.instruments.contains_key("EURUSD") {
+        "EURUSD"
+    } else {
+        strategy
+            .instruments
+            .keys()
+            .next()
+            .ok_or("no configured instruments")?
+    };
+    inspect_symbol(path, as_of, strategy, symbol)
 }
 pub fn inspect_symbol(
     path: &Path,
@@ -170,6 +179,9 @@ pub fn inspect_symbol(
     strategy: &crate::model::Strategy,
     symbol: &str,
 ) -> Result<Value> {
+    if !strategy.instruments.contains_key(symbol) {
+        return Err("instrument is not configured".into());
+    }
     if !path.is_file() {
         return Err("database does not exist".into());
     }
@@ -199,9 +211,9 @@ pub fn inspect_symbol(
         let payload: String = row.get(1).map_err(db_error)?;
         let minute: Minute = serde_json::from_str(&payload).map_err(|_| "corrupt stored minute")?;
         for (i, tf) in [
-            crate::engine::Timeframe::H4,
-            crate::engine::Timeframe::D,
-            crate::engine::Timeframe::W,
+            crate::market::Timeframe::H4,
+            crate::market::Timeframe::D,
+            crate::market::Timeframe::W,
         ]
         .into_iter()
         .enumerate()
@@ -237,13 +249,9 @@ pub fn inspect_symbol(
         }
     }
     let mut bars = BTreeMap::new();
-    for ((name, limit), a) in [
-        ("H4", strategy.context.bars_analyzed.h4),
-        ("D", strategy.context.bars_analyzed.d),
-        ("W", strategy.context.bars_analyzed.w),
-    ]
-    .into_iter()
-    .zip(aggregates)
+    for ((name, limit), a) in [("H4", 200_u64), ("D", 200_u64), ("W", 200_u64)]
+        .into_iter()
+        .zip(aggregates)
     {
         let skip = a
             .len()

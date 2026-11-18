@@ -17,4 +17,3 @@
 !backtest/report/
 !backtest/report/*.py
 !backtest/report/requirements.txt
-!backtest/data-sources.json

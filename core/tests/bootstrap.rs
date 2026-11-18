@@ -1,6 +1,6 @@
 use forex_core::{
-    engine::Timeframe,
     feed::{Aggregator, Tick},
+    market::Timeframe,
     prices::{utc, Minute},
 };
 #[test]

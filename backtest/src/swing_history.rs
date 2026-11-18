@@ -1,10 +1,9 @@
 //! Swing rules over prepared minutes, with bars from the bot's own aggregator.
 use crate::history::{json_file, read_minutes};
 use forex_core::{
-    engine::Timeframe,
     feed::Aggregator,
+    market::{Candle, Timeframe},
     swing::{grid_time, rules_bars, Bar, Swing, Tf},
-    trading::Candle,
 };
 use std::path::{Path, PathBuf};
 

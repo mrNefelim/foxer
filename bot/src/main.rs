@@ -74,7 +74,7 @@ fn main() -> ExitCode {
         let result = if args[0] == "import-history" {
             forex_bot::data::import_history(Path::new(&args[1]), Path::new(&args[2]))
         } else {
-            forex_bot::load(Path::new("strategy/fvg-bot-rules.json")).and_then(|strategy| {
+            forex_bot::load(Path::new("strategy/swing-rules.json")).and_then(|strategy| {
                 let time = args[2].to_str().ok_or("invalid UTC argument")?;
                 forex_bot::data::inspect(Path::new(&args[1]), time, &strategy)
             })
@@ -100,7 +100,7 @@ fn main() -> ExitCode {
     let path = args
         .get(1)
         .map(Path::new)
-        .unwrap_or_else(|| Path::new("strategy/fvg-bot-rules.json"));
+        .unwrap_or_else(|| Path::new("strategy/swing-rules.json"));
     match forex_bot::load(path) {
         Ok(strategy) => {
             if args[0] == "describe-config" {

@@ -1,11 +1,9 @@
 use crate::{
-    engine::{Engine, Timeframe},
     feed::Tick,
     http::{Api, Failure},
     protocols::{self, Analysis, Comment, Image},
     runtime::Runtime,
     settings::Settings,
-    trading::Candle,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -36,12 +34,12 @@ pub fn smoke(db: &Path, strategy: &Path) -> Result<String, String> {
         return Err("smoke-test requires a new database path".into());
     }
     let rules = rules(strategy)?;
-    let mut r = Runtime::open(db, rules.clone(), Engine::default())?;
+    let mut r = Runtime::open(db, rules.clone())?;
     r.link(9, "smoke-signal")?;
     let update = json!({"update_id":1,"message":{"message_id":10,"chat":{"id":-1},"from":{"id":11},"text":"smoke","reply_to_message":{"message_id":9}}});
     r.update(&update, -1)?;
     drop(r);
-    let mut r = Runtime::open(db, rules, Engine::default())?;
+    let mut r = Runtime::open(db, rules)?;
     r.update(&update, -1)?;
     if r.offset() != 2 || r.next_comment().map(|c| c.update_id) != Some(1) {
         return Err("smoke restore failed".into());
@@ -89,52 +87,6 @@ pub fn probe(path: &Path) -> Result<String, String> {
     Ok(format!(
         "Telegram access OK; Upscale index snapshots: {snapshots}; OpenAI not called."
     ))
-}
-pub(crate) fn history_engine(
-    database: &Path,
-    cfg: &crate::model::Strategy,
-    symbol: &str,
-) -> Result<Engine, String> {
-    let mut engine = Engine::default();
-    let time = chrono::DateTime::from_timestamp(now(), 0)
-        .ok_or("invalid system time")?
-        .to_rfc3339();
-    let report = crate::data::inspect_symbol(database, &time, cfg, symbol)?;
-    for (name, tf) in [
-        ("W", Timeframe::W),
-        ("D", Timeframe::D),
-        ("H4", Timeframe::H4),
-    ] {
-        let bars = report["bars"][name]
-            .as_array()
-            .ok_or("invalid history context")?;
-        let mut source = None;
-        for b in bars {
-            let current = b["source"].as_str().ok_or("missing history source")?;
-            if source.is_some_and(|s| s != current) {
-                return Err("mixed historical sources".into());
-            }
-            source = Some(current);
-            let end = chrono::DateTime::parse_from_rfc3339(
-                b["end_utc"].as_str().ok_or("invalid history time")?,
-            )
-            .map_err(|_| "invalid history time")?
-            .timestamp();
-            let price = |key: &str| b[key].as_i64().ok_or("invalid history price");
-            engine.seed(
-                tf,
-                Candle {
-                    end,
-                    open: price("open")?,
-                    high: price("high")?,
-                    low: price("low")?,
-                    close: price("close")?,
-                },
-                cfg,
-            )?;
-        }
-    }
-    Ok(engine)
 }
 fn image_mime(bytes: &[u8]) -> Result<String, Failure> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -337,12 +289,7 @@ pub fn swing_warmup(
 }
 /// Connects the swing rules file to the runtime, one instrument at a time.
 fn connect_swing(runtime: &mut Runtime, c: &Settings) -> Result<(), String> {
-    let Some(path) = &c.swing_strategy else {
-        return runtime.reconcile_swing(&std::collections::BTreeSet::new());
-    };
-    let file: Value =
-        serde_json::from_slice(&std::fs::read(path).map_err(|_| "cannot read swing rules file")?)
-            .map_err(|e| format!("invalid swing rules file: {e}"))?;
+    let file = runtime.rules();
     let instruments = file["instruments"]
         .as_object()
         .ok_or("swing rules file has no instruments")?;
@@ -358,9 +305,10 @@ fn connect_swing(runtime: &mut Runtime, c: &Settings) -> Result<(), String> {
 pub fn run(path: &Path) -> Result<String, String> {
     let c = Settings::load(path)?;
     let cfg = crate::load(&c.strategy)?;
-    let symbols: Vec<String> = cfg.instruments.iter().map(|i| i.symbol.clone()).collect();
-    if cfg.candles.price_basis != "index" {
-        return Err("run requires candles.price_basis=index for Upscale".into());
+    for config in cfg.instruments.values() {
+        if config.reference_exit.is_some() {
+            return Err("swing reference_exit is not available in the live bot".into());
+        }
     }
     let key = c.upscale_key.as_deref().ok_or("missing UPSCALE_API_KEY")?;
     let client =
@@ -370,9 +318,10 @@ pub fn run(path: &Path) -> Result<String, String> {
         return Err("expected exactly one active API-enabled demo account".into());
     }
     let account = accounts[0].clone();
-    let mut runtime = Runtime::open_file(&c.database, &c.strategy, Engine::default())?;
+    let mut runtime = Runtime::open_file(&c.database, &c.strategy)?;
     runtime.started(now())?;
     connect_swing(&mut runtime, &c)?;
+    let symbols = runtime.symbols();
     let (tx, rx) = mpsc::sync_channel(1024);
     let feed_tx = tx.clone();
     let subscribed = symbols.clone();
@@ -447,7 +396,7 @@ pub fn run(path: &Path) -> Result<String, String> {
                 api_busy = false;
                 api_at = Instant::now() + Duration::from_secs(if result.is_ok() { 0 } else { 60 });
                 match result {
-    Ok((a,usage))=>{runtime.analysis(id,&a,&usage)?;},
+    Ok((a,usage))=>{runtime.analysis(id,&a,&usage)?;connect_swing(&mut runtime,&c)?;},
     Err(Failure::Invalid)=>runtime.analysis(id,&Analysis{action:"clarify".into(),explanation:"Не удалось разобрать комментарий или изображение. Правила сохранены. Пришлите уточнение ответом на это сообщение.".into(),changes:vec![]},&json!({}))?,
     Err(e)=>{eprintln!("OpenAI job: {e}");runtime.api_outage()?;}
    }
@@ -545,7 +494,7 @@ mod tests {
     }
 
     fn swing_rules() -> Value {
-        serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap()
+        serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap()
     }
 
     fn swing_config() -> Value {
@@ -571,23 +520,6 @@ mod tests {
         }
     }
 
-    fn seed_main_stop(runtime: &mut Runtime) {
-        let mut engine = Engine::default();
-        let mut snapshot = serde_json::to_value(&engine).unwrap();
-        snapshot["signals"] = json!([{
-            "id": "main-test",
-            "side": "Long",
-            "entry": 1_100_000,
-            "stop": 1_090_000,
-            "target": 1_200_000,
-            "take_profit": 1_200_000,
-            "state": "Active",
-            "last_quote_time": 0
-        }]);
-        engine = serde_json::from_value(snapshot).unwrap();
-        runtime.seed_instrument("EURUSD", engine).unwrap();
-    }
-
     fn gap_ticks(runtime: &mut Runtime) {
         for (at, price) in [
             ("2026-01-05T10:00:00Z", 1.10000),
@@ -606,106 +538,61 @@ mod tests {
         }
     }
 
-    fn settings(path: &std::path::Path, swing_strategy: Option<std::path::PathBuf>) -> Settings {
-        Settings {
-            chat: -1,
-            model: "test".into(),
-            telegram_token: "test".into(),
-            openai_key: "test".into(),
-            upscale_key: None,
-            max_tokens: 100,
-            database: path.into(),
-            strategy: "strategy/fvg-bot-rules.json".into(),
-            stale_seconds: 60,
-            swing_strategy,
-        }
-    }
-
     #[test]
-    fn removing_swing_setting_restores_main_publication_and_tracks_old_position() {
+    fn removed_instrument_keeps_saved_swing_position_and_monitors_its_exit() {
         let path = swing_db();
         {
-            let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
-            seed_main_stop(&mut runtime);
+            let mut runtime = Runtime::open(&path, swing_rules()).unwrap();
             runtime
                 .swing("EURUSD", swing_config(), || Ok(prepared_swing()))
                 .unwrap();
             gap_ticks(&mut runtime);
         }
-
-        // Emulate a persisted v4 snapshot written before the tracking-only flag existed.
         let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute(
-            "UPDATE entities SET payload=json_remove(payload, '$.markets.EURUSD.swing.enabled') WHERE kind='runtime' AND key='coordinator'",
-            [],
-        )
-        .unwrap();
+        db.execute("UPDATE entities SET payload=json_remove(payload, '$.markets.EURUSD.swing.enabled') WHERE kind='runtime' AND key='coordinator'", []).unwrap();
         drop(db);
-
-        let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
+        let mut document = swing_rules();
+        document["instruments"]
+            .as_object_mut()
+            .unwrap()
+            .remove("EURUSD");
+        let mut runtime = Runtime::open(&path, document).unwrap();
         let before = runtime.swing_rules("EURUSD").unwrap().trades()[0].clone();
-        connect_swing(&mut runtime, &settings(&path, None)).unwrap();
-        let restored = &runtime.swing_rules("EURUSD").unwrap().trades()[0];
-        assert_eq!(restored.state, forex_core::swing::TradeState::Active);
-        assert_eq!(restored.state, before.state);
-        assert_eq!(
-            (restored.entry, restored.stop, restored.tp),
-            (before.entry, before.stop, before.tp)
-        );
-
+        assert_eq!(before.state, crate::swing::TradeState::Active);
+        assert!(runtime.symbols().contains(&"EURUSD".into()));
         runtime
             .tick(swing_tick("2026-01-05T22:30:00Z", 1.09000), true)
             .unwrap();
-        let texts: Vec<_> = runtime
-            .pending()
-            .unwrap()
-            .into_iter()
-            .map(|out| out.payload["text"].as_str().unwrap().to_owned())
-            .collect();
-        assert!(
-            texts.iter().any(|text| text.contains("Состояние Stop")),
-            "the main engine must publish again after swing is disabled: {texts:?}"
-        );
-        assert!(
-            texts.iter().any(|text| text.contains("Стоп")),
-            "the old swing trade must still be tracked: {texts:?}"
-        );
+        let messages = runtime.pending().unwrap();
+        assert!(messages
+            .iter()
+            .any(|message| message.payload["text"].as_str().unwrap().contains("Стоп")));
+        assert!(messages
+            .iter()
+            .filter_map(|message| message.payload["signal_id"].as_str())
+            .all(|id| id.contains(":swing:")));
         std::fs::remove_file(path).ok();
     }
 
     #[test]
-    fn removed_swing_rules_do_not_publish_waiting_plans() {
-        for remove_setting in [true, false] {
-            let path = swing_db();
-            let mut file_path = None;
-            {
-                let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
-                runtime
-                    .swing("EURUSD", swing_config(), || Ok(prepared_swing()))
-                    .unwrap();
-            }
-            let setting = if remove_setting {
-                None
-            } else {
-                let file = path.with_extension("swing.json");
-                std::fs::write(&file, r#"{"instruments":{}}"#).unwrap();
-                file_path = Some(file.clone());
-                Some(file)
-            };
-            let mut runtime = Runtime::open(&path, swing_rules(), Engine::default()).unwrap();
-            connect_swing(&mut runtime, &settings(&path, setting)).unwrap();
-            let before = runtime.pending().unwrap().len();
-            gap_ticks(&mut runtime);
-            assert_eq!(
-                runtime.pending().unwrap().len(),
-                before,
-                "removed swing rules must not publish a waiting plan"
-            );
-            std::fs::remove_file(path).ok();
-            if let Some(file) = file_path {
-                std::fs::remove_file(file).ok();
-            }
+    fn removed_instrument_does_not_publish_waiting_plans() {
+        let path = swing_db();
+        {
+            let mut runtime = Runtime::open(&path, swing_rules()).unwrap();
+            runtime
+                .swing("EURUSD", swing_config(), || Ok(prepared_swing()))
+                .unwrap();
         }
+        let mut document = swing_rules();
+        document["instruments"]
+            .as_object_mut()
+            .unwrap()
+            .remove("EURUSD");
+        let mut runtime = Runtime::open(&path, document).unwrap();
+        let before = runtime.pending().unwrap().len();
+        gap_ticks(&mut runtime);
+        assert_eq!(runtime.pending().unwrap().len(), before);
+        std::fs::remove_file(path).ok();
     }
     #[test]
     fn scheduled_pause_worker_emits_only_status_until_fresh_resume() {
@@ -834,7 +721,6 @@ mod tests {
             database: dir.join("db.sqlite"),
             strategy: "unused".into(),
             stale_seconds: 120,
-            swing_strategy: None,
         };
         let comment = Comment {
             update_id: 1,
@@ -845,8 +731,15 @@ mod tests {
             text: "Что на изображении?".into(),
             files: vec!["fixture-image".into()],
         };
-        let (a, usage) =
-            analyze_at(&cfg, &comment, json!({"id":"s"}), json!({}), &base, &base).unwrap();
+        let (a, usage) = analyze_at(
+            &cfg,
+            &comment,
+            json!({"id":"s"}),
+            swing_rules(),
+            &base,
+            &base,
+        )
+        .unwrap();
         assert_eq!(a.action, "no_change");
         assert_eq!(usage["input_tokens"], 20);
         let requests = server.join().unwrap();

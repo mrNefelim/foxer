@@ -22,7 +22,6 @@ services:
     volumes:
       - ./strategy:/app/strategy:ro
       - ./data/index-history:/app/data/index-history:ro
-      - ./backtest/data-sources.json:/app/backtest/data-sources.json:ro
       - ./reports/backtests:/app/reports/backtests
 volumes:
   cargo-registry:

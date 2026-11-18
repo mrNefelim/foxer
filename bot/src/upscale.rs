@@ -451,11 +451,7 @@ pub fn probe(path: &std::path::Path) -> Result<String, String> {
         .as_deref()
         .ok_or("missing UPSCALE_API_KEY")?;
     let strategy = crate::load(&settings.strategy)?;
-    let symbols: Vec<_> = strategy
-        .instruments
-        .iter()
-        .map(|i| i.symbol.clone())
-        .collect();
+    let symbols: Vec<_> = strategy.instruments.keys().cloned().collect();
     let client = Client::new(BASE_URL, key).map_err(|e| e.to_string())?;
     let accounts = client.demo_accounts().map_err(|e| e.to_string())?;
     let mut reports = Vec::new();

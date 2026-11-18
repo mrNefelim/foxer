@@ -20,8 +20,8 @@ impl Fixture {
         fs::create_dir_all(root.join("prepared")).unwrap();
         fs::create_dir_all(root.join("strategy")).unwrap();
         fs::write(
-            root.join("strategy/fvg-bot-rules.json"),
-            include_str!("../../strategy/fvg-bot-rules.json"),
+            root.join("strategy/swing-rules.json"),
+            include_str!("../../strategy/swing-rules.json"),
         )
         .unwrap();
         Self { root }
@@ -220,7 +220,7 @@ fn imports_same_timestamp_for_different_pairs_without_mixing_history() {
         forex_bot::data::import_history_symbol(&db, &f.root, "GBPUSD").unwrap()["inserted_minutes"],
         0
     );
-    let cfg = forex_bot::load(&f.root.join("strategy/fvg-bot-rules.json")).unwrap();
+    let cfg = forex_bot::load(&f.root.join("strategy/swing-rules.json")).unwrap();
     for symbol in ["EURUSD", "GBPUSD"] {
         let v = forex_bot::data::inspect_symbol(&db, "2026-01-12T22:00:00Z", &cfg, symbol).unwrap();
         assert_eq!(v["m1_count"], 3);
@@ -245,4 +245,21 @@ fn missing_source_is_rejected() {
         assert!(!f.import().status.success());
         assert!(!f.root.join("state.sqlite").exists());
     }
+}
+
+#[test]
+fn inspection_uses_a_configured_pair_when_eurusd_is_absent() {
+    let fixture = Fixture::new();
+    fixture.prepare(&rows());
+    assert!(fixture.import().status.success());
+    let path = fixture.root.join("strategy/swing-rules.json");
+    let mut rules: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    rules["instruments"]
+        .as_object_mut()
+        .unwrap()
+        .retain(|symbol, _| symbol == "USDJPY");
+    fs::write(path, rules.to_string()).unwrap();
+    let report = fixture.inspect("2026-01-12T22:00:00Z");
+    assert_eq!(report["symbol"], "USDJPY");
+    assert_eq!(report["m1_count"], 0);
 }

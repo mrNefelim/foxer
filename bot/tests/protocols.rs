@@ -51,7 +51,7 @@ fn vision_request_includes_image_and_only_supplied_context() {
         500,
         &c,
         &json!({"entry":100}),
-        &json!({"stop_buffer_atr":0.05}),
+        &serde_json::from_str::<Value>(include_str!("../../strategy/swing-rules.json")).unwrap(),
         &[Image {
             mime: "image/png".into(),
             bytes: vec![1, 2, 3],
@@ -86,18 +86,34 @@ fn parses_completed_response_and_rejects_refusal_or_truncation() {
 #[test]
 fn valid_patch_changes_only_requested_parameter_and_invalid_patch_is_atomic() {
     let original: Value =
-        serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap();
+        serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap();
     let change = Analysis {
         action: "apply".into(),
         explanation: "буфер".into(),
         changes: vec![Change {
-            path: "/parameters/stop_buffer_atr/value".into(),
+            path: "/instruments/EURUSD/stop_buffer_atr".into(),
             value: json!(0.1),
         }],
     };
     let patched = apply_changes(&original, &change).unwrap();
-    assert_eq!(patched["parameters"]["stop_buffer_atr"]["value"], 0.1);
-    assert_eq!(original["parameters"]["stop_buffer_atr"]["value"], 0.05);
+    assert_eq!(patched["instruments"]["EURUSD"]["stop_buffer_atr"], 0.1);
+    let mut expected = original.clone();
+    expected["instruments"]["EURUSD"]["stop_buffer_atr"] = json!(0.1);
+    assert_eq!(patched, expected);
+    let mut mixed = Analysis {
+        action: "apply".into(),
+        explanation: "mixed".into(),
+        changes: vec![Change {
+            path: "/instruments/EURUSD/stop_buffer_atr".into(),
+            value: json!(0.1),
+        }],
+    };
+    mixed.changes.push(Change {
+        path: "/instruments/GBPUSD/plan_days".into(),
+        value: json!(0),
+    });
+    assert!(apply_changes(&original, &mixed).is_err());
+    assert_eq!(original["instruments"]["EURUSD"]["stop_buffer_atr"], 0.05);
     let bad = Analysis {
         action: "apply".into(),
         explanation: "bad".into(),
@@ -111,7 +127,7 @@ fn valid_patch_changes_only_requested_parameter_and_invalid_patch_is_atomic() {
         action: "apply".into(),
         explanation: "bad".into(),
         changes: vec![Change {
-            path: "/parameters/plan_days/value".into(),
+            path: "/instruments/GBPUSD/plan_days".into(),
             value: json!(-1),
         }],
     };
@@ -119,12 +135,12 @@ fn valid_patch_changes_only_requested_parameter_and_invalid_patch_is_atomic() {
 }
 #[test]
 fn sequential_patches_preserve_unrelated_previous_changes() {
-    let v: Value = serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap();
+    let v: Value = serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap();
     let a = Analysis {
         action: "apply".into(),
         explanation: "a".into(),
         changes: vec![Change {
-            path: "/parameters/plan_days/value".into(),
+            path: "/instruments/GBPUSD/plan_days".into(),
             value: json!(12),
         }],
     };
@@ -132,11 +148,13 @@ fn sequential_patches_preserve_unrelated_previous_changes() {
         action: "apply".into(),
         explanation: "b".into(),
         changes: vec![Change {
-            path: "/parameters/stop_buffer_atr/value".into(),
+            path: "/instruments/EURUSD/stop_buffer_atr".into(),
             value: json!(0.2),
         }],
     };
     let r = apply_changes(&apply_changes(&v, &a).unwrap(), &b).unwrap();
-    assert_eq!(r["parameters"]["plan_days"]["value"], 12);
-    assert_eq!(r["parameters"]["stop_buffer_atr"]["value"], 0.2);
+    assert_eq!(r["instruments"]["GBPUSD"]["plan_days"], 12);
+    assert_eq!(r["instruments"]["EURUSD"]["stop_buffer_atr"], 0.2);
+    assert_eq!(r["instruments"]["USDJPY"], v["instruments"]["USDJPY"]);
+    assert_eq!(r["comments"], v["comments"]);
 }

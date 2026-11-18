@@ -22,9 +22,9 @@
 ## Навигация и границы изменений
 
 - Источники контекста: `docs/bot-plan/requirements.md`, `architecture.md`,
-  `development-plan.md` в том же каталоге и `strategy/fvg-bot-rules.json`.
+  `development-plan.md` в том же каталоге и `strategy/swing-rules.json`.
   Этот файл задаёт способ работы агента, а не повторяет требования продукта.
-- Рабочий `strategy/fvg-bot-rules.json` локальный и исключён из Git.
+- Рабочий `strategy/swing-rules.json` содержит текущие правила Swing.
   Публикуемый `example.json` копируется в рабочий путь при начальной настройке.
   Тесты читают рабочий JSON; перед их запуском файл должен существовать.
   При изменении правил синхронизируй рабочий JSON, пример и соответствующую

@@ -1,6 +1,6 @@
 use forex_bot::settings::Settings;
 fn valid() -> String {
-    "TELEGRAM_BOT_TOKEN=fake-token\nTELEGRAM_CHAT_ID=-100123\nOPENAI_API_KEY=fake-key\nOPENAI_MODEL=test-model\nOPENAI_MAX_TOKENS=1500\nDATABASE_PATH=data/signals.sqlite\nSTRATEGY_PATH=strategy/fvg-bot-rules.json\nQUOTE_STALE_SECONDS=120\nPRICE_TICK=1\n".into()
+    "TELEGRAM_BOT_TOKEN=fake-token\nTELEGRAM_CHAT_ID=-100123\nOPENAI_API_KEY=fake-key\nOPENAI_MODEL=test-model\nOPENAI_MAX_TOKENS=1500\nDATABASE_PATH=data/signals.sqlite\nSTRATEGY_PATH=strategy/swing-rules.json\nQUOTE_STALE_SECONDS=120\n".into()
 }
 #[test]
 fn parses_settings_without_author_allowlist_or_manual_data_gate() {
@@ -12,7 +12,7 @@ fn rejects_empty_missing_duplicate_unknown_and_invalid_settings() {
     for s in [
         String::new(),
         valid().replace("fake-token", ""),
-        format!("{}PRICE_TICK=1\n", valid()),
+        format!("{}OPENAI_MODEL=duplicate\n", valid()),
         format!("{}UNKNOWN=private-value\n", valid()),
         valid().replace("SECONDS=120", "SECONDS=0"),
     ] {
@@ -27,8 +27,8 @@ fn quotes_are_literal_and_not_shell_expanded() {
     assert_eq!(c.model, "$(do-not-run)");
 }
 #[test]
-fn global_price_tick_is_not_required_when_instrument_ticks_are_in_json() {
-    assert!(Settings::parse(&valid().replace("PRICE_TICK=1\n", "")).is_ok());
+fn single_strategy_path_needs_no_secondary_strategy_or_price_tick() {
+    assert!(Settings::parse(&valid()).is_ok());
 }
 
 #[test]
@@ -62,11 +62,7 @@ fn upscale_key_preserves_strict_validation_without_exposing_values() {
     }
 }
 #[test]
-fn swing_rules_path_is_optional() {
-    assert_eq!(Settings::parse(&valid()).unwrap().swing_strategy, None);
-    let c = Settings::parse(&format!("{}SWING_STRATEGY=strategy/swing.json\n", valid())).unwrap();
-    assert_eq!(
-        c.swing_strategy.as_deref(),
-        Some(std::path::Path::new("strategy/swing.json"))
-    );
+fn removed_secondary_strategy_setting_is_rejected() {
+    assert!(Settings::parse(&format!("{}SWING_STRATEGY=strategy/swing.json\n", valid())).is_err());
+    assert!(Settings::parse(&format!("{}PRICE_TICK=1\n", valid())).is_err());
 }

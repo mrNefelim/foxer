@@ -27,7 +27,7 @@ impl Workspace {
     }
     fn write(&self, value: &Value) {
         fs::write(
-            self.0.join("strategy/fvg-bot-rules.json"),
+            self.0.join("strategy/swing-rules.json"),
             serde_json::to_vec(value).unwrap(),
         )
         .unwrap();
@@ -39,12 +39,12 @@ impl Drop for Workspace {
     }
 }
 fn working() -> Value {
-    serde_json::from_str(include_str!("../../strategy/fvg-bot-rules.json")).unwrap()
+    serde_json::from_str(include_str!("../../strategy/swing-rules.json")).unwrap()
 }
 fn rejection(value: Value, category: &str) {
     let w = Workspace::new();
     w.write(&value);
-    let before = fs::read(w.0.join("strategy/fvg-bot-rules.json")).unwrap();
+    let before = fs::read(w.0.join("strategy/swing-rules.json")).unwrap();
     let out = w.run(&["check-config"]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
@@ -53,12 +53,12 @@ fn rejection(value: Value, category: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        fs::read(w.0.join("strategy/fvg-bot-rules.json")).unwrap(),
+        fs::read(w.0.join("strategy/swing-rules.json")).unwrap(),
         before
     );
 }
 #[test]
-fn reads_working_spec_including_gap() {
+fn reads_working_swing_document() {
     let w = Workspace::new();
     w.write(&working());
     let out = w.run(&["check-config"]);
@@ -92,9 +92,9 @@ fn published_example_is_a_valid_strategy() {
 #[test]
 fn accepts_changed_numeric_parameters() {
     let mut v = working();
-    v["parameters"]["plan_days"]["value"] = json!(12);
-    v["parameters"]["stop_buffer_atr"]["value"] = json!(0);
-    v["parameters"]["min_fvg_atr"]["value"] = json!(0.08);
+    v["instruments"]["EURUSD"]["plan_days"] = json!(12);
+    v["instruments"]["GBPUSD"]["stop_buffer_atr"] = json!(0);
+    v["instruments"]["USDJPY"]["rr_fixed"] = json!(2.5);
     let w = Workspace::new();
     w.write(&v);
     assert!(w.run(&["check-config"]).status.success());
@@ -109,16 +109,16 @@ fn missing_working_file_never_falls_back_to_example() {
 }
 #[test]
 fn incomplete_spec_is_not_a_working_config() {
-    rejection(json!({"schema_version": 2}), "structure");
+    rejection(json!({"comment": "Incomplete"}), "structure");
 }
 #[test]
 fn malformed_and_duplicate_json_are_rejected_without_echoing_values() {
     for content in [
         "{\"secret\":\"DO_NOT_ECHO\",",
-        "{\"schema_version\":1,\"schema_version\":1}",
+        "{\"instruments\":{},\"instruments\":{}}",
     ] {
         let w = Workspace::new();
-        fs::write(w.0.join("strategy/fvg-bot-rules.json"), content).unwrap();
+        fs::write(w.0.join("strategy/swing-rules.json"), content).unwrap();
         let out = w.run(&["check-config"]);
         assert_eq!(out.status.code(), Some(1));
         let error = String::from_utf8_lossy(&out.stderr);
@@ -127,154 +127,113 @@ fn malformed_and_duplicate_json_are_rejected_without_echoing_values() {
     }
 }
 #[test]
-fn rejects_unknown_fields_and_comment_types_at_all_depths() {
-    for path in [
-        "",
-        "/policies/zones",
-        "/policies/execution",
-        "/parameters/plan_days",
-        "/candles/weekly_boundary",
-        "/instruments/0",
-    ] {
+fn rejects_unknown_fields_and_comment_types_at_all_supported_depths() {
+    for path in ["", "/instruments/EURUSD", "/instruments/GBPUSD/range"] {
         let mut v = working();
         v.pointer_mut(path).unwrap()["unknown"] = json!(true);
         rejection(v, "structure");
+    }
+    for path in ["/comment", "/comments/plan_days"] {
         let mut v = working();
-        v.pointer_mut(path).unwrap()["comment"] = json!(42);
+        *v.pointer_mut(path).unwrap() = json!(42);
         rejection(v, "structure");
     }
+    let mut v = working();
+    v["instruments"]["EURUSD"]["comment"] = json!("Nested notes are not configuration");
+    rejection(v, "structure");
 }
 #[test]
 fn rejects_missing_fields_and_wrong_types() {
     for path in [
-        "/candles/only_closed_bars",
-        "/parameters/plan_days/value",
-        "/policies/zones/gap",
-        "/parameters/rr_min/value",
+        "/instruments/EURUSD/plan_days",
+        "/instruments/EURUSD/take_profit",
+        "/instruments/GBPUSD/range/enabled",
+        "/instruments/USDJPY/entry_close_hours",
     ] {
         let mut v = working();
         *v.pointer_mut(path).unwrap() = json!(["wrong"]);
         rejection(v, "structure");
     }
-    for field in ["gap", "fvg"] {
+    for field in ["atr_period", "rr_fixed", "range", "cost"] {
         let mut v = working();
-        v["policies"]["zones"]
+        v["instruments"]["EURUSD"]
             .as_object_mut()
             .unwrap()
             .remove(field);
         rejection(v, "structure");
     }
     let mut v = working();
-    v["parameters"]["rr_min"]
+    v["instruments"]["GBPUSD"]["range"]
         .as_object_mut()
         .unwrap()
-        .remove("value");
+        .remove("window_min");
     rejection(v, "structure");
 }
 #[test]
-fn rejects_old_future_and_unsupported_policies() {
-    for version in [1, 3] {
-        let mut v = working();
-        v["schema_version"] = json!(version);
-        rejection(v, "expected 2");
-    }
-    for (path, value, category) in [
+fn rejects_unknown_family_and_incomplete_family_configuration() {
+    let mut v = working();
+    v["instruments"]["EURUSD"]["family"] = json!("invented");
+    rejection(v, "structure");
+    let mut v = working();
+    v["instruments"]["EURUSD"]["family"] = json!("trend_pullback");
+    rejection(v, "requires trend_pullback parameters");
+    let mut v = working();
+    v["instruments"]["EURUSD"]["take_profit"] = json!("last_close");
+    rejection(v, "structure");
+}
+#[test]
+fn rejects_invalid_periods_prices_hours_and_range_boundaries() {
+    for (path, value, diagnostic) in [
+        ("/instruments/EURUSD/plan_days", json!(0), "positive"),
+        ("/instruments/EURUSD/atr_period", json!(0), "positive"),
         (
-            "/policies/execution/market_quote",
-            json!("last_close"),
-            "structure",
+            "/instruments/GBPUSD/stop_lookback_h4_bars",
+            json!(0),
+            "positive",
         ),
         (
-            "/policies/execution/entry_mode",
-            json!("unsupported_mode"),
-            "structure",
+            "/instruments/GBPUSD/stop_buffer_atr",
+            json!(-0.1),
+            "stop buffer",
+        ),
+        ("/instruments/USDJPY/rr_fixed", json!(0), "positive"),
+        ("/instruments/USDJPY/rr_target_cap", json!(-1), "positive"),
+        ("/instruments/USDJPY/cost", json!(-0.1), "nonnegative"),
+        ("/instruments/EURUSD/entry_close_hours", json!([]), "hours"),
+        (
+            "/instruments/EURUSD/entry_close_hours",
+            json!([0, 24]),
+            "hours",
         ),
         (
-            "/policies/modules/range_trading",
-            json!(true),
-            "unsupported",
+            "/instruments/EURUSD/entry_close_hours",
+            json!([0, 0]),
+            "hours",
         ),
-        ("/candles/timezone", json!("UTC"), "unsupported"),
+        ("/instruments/EURUSD/range/window_max", json!(1), "range"),
+        ("/instruments/EURUSD/range/wick_min", json!(-1), "range"),
         (
-            "/policies/targets/weekly_poi_daily_alternative/minimum_rr",
-            json!("rr_max_trend"),
-            "structure",
-        ),
-        (
-            "/policies/plans/daily_poi",
-            json!("weekly_zone"),
-            "structure",
+            "/instruments/EURUSD/range/height_max_atr_d",
+            json!(0.01),
+            "range",
         ),
     ] {
         let mut v = working();
         *v.pointer_mut(path).unwrap() = value;
-        rejection(v, category);
-    }
-}
-#[test]
-fn rejects_invalid_ranges_and_inconsistent_context() {
-    for (path, value) in [
-        ("/parameters/plan_days/value", json!(0)),
-        ("/parameters/atr_period/value", json!(0)),
-        ("/parameters/stop_buffer_atr/value", json!(-0.1)),
-        ("/parameters/rr_min/value", json!(0)),
-        ("/parameters/rr_max_trend/value", json!(1)),
-        ("/context/minimum_bars/W", json!(0)),
-    ] {
-        let mut v = working();
-        *v.pointer_mut(path).unwrap() = value;
-        rejection(v, "range");
-    }
-    for key in [
-        "stop_fallback_h4_bars",
-        "confirmation_inversion_h4_bars",
-        "weekly_fractal_sweep_lookback_bars",
-        "target_fractal_lookback_d_bars",
-        "target_fractal_lookback_w_bars",
-    ] {
-        let mut v = working();
-        v["parameters"][key]["value"] = json!(0);
-        rejection(v, "range");
-        let mut v = working();
-        v["parameters"][key]["value"] = json!(1.5);
-        rejection(v, "structure");
+        rejection(v, diagnostic);
     }
     let mut v = working();
-    v["context"]["bars_analyzed"]["W"] = json!(1);
-    rejection(v, "inconsistent");
-    let mut v = working();
-    v["parameters"]["rr_min"]["value"] = json!(11);
-    rejection(v, "range");
-}
-#[test]
-fn rejects_unknown_duplicate_and_missing_rules_and_variants() {
-    for path in [
-        "/policies/plans/daily_rules",
-        "/policies/plans/weekly_rules",
-        "/policies/plans/confirmation",
-        "/policies/plans/entry",
-        "/policies/execution/pending_cancel_on",
-    ] {
-        let mut v = working();
-        v.pointer_mut(path).unwrap()[0] = json!("invented");
-        rejection(v, "structure");
-        let mut v = working();
-        let a = v.pointer_mut(path).unwrap().as_array_mut().unwrap();
-        a.push(a[0].clone());
-        rejection(v, "rule");
-        let mut v = working();
-        v.pointer_mut(path).unwrap().as_array_mut().unwrap().pop();
-        rejection(v, "rule");
-    }
+    v["instruments"]["EURUSD"]["atr_period"] = json!(1.5);
+    rejection(v, "structure");
 }
 #[test]
 fn nested_duplicates_and_duplicate_comments_are_rejected() {
     for content in [
-        "{\"schema_version\":2,\"parameters\":{\"x\":1,\"x\":2}}",
-        "{\"schema_version\":2,\"comment\":\"a\",\"comment\":\"b\"}",
+        "{\"instruments\":{\"EURUSD\":{},\"EURUSD\":{}}}",
+        "{\"comment\":\"a\",\"comment\":\"b\"}",
     ] {
         let w = Workspace::new();
-        fs::write(w.0.join("strategy/fvg-bot-rules.json"), content).unwrap();
+        fs::write(w.0.join("strategy/swing-rules.json"), content).unwrap();
         assert!(!w.run(&["check-config"]).status.success());
     }
 }
@@ -288,7 +247,7 @@ fn usage_errors_do_not_start_service() {
 fn describe(v: &Value) -> Value {
     let w = Workspace::new();
     w.write(v);
-    let before = fs::read(w.0.join("strategy/fvg-bot-rules.json")).unwrap();
+    let before = fs::read(w.0.join("strategy/swing-rules.json")).unwrap();
     let out = w.run(&["describe-config"]);
     assert!(
         out.status.success(),
@@ -296,33 +255,33 @@ fn describe(v: &Value) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        fs::read(w.0.join("strategy/fvg-bot-rules.json")).unwrap(),
+        fs::read(w.0.join("strategy/swing-rules.json")).unwrap(),
         before
     );
     serde_json::from_slice(&out.stdout).unwrap()
 }
 #[test]
-fn describe_covers_values_constraints_comments_and_disabled_modules_without_echoing_prose() {
+fn describe_covers_swing_values_constraints_and_comments_without_echoing_prose() {
     let mut v = working();
     v["comment"] = json!("PRIVATE_TEXT");
-    v["parameters"]["plan_days"]["value"] = json!(17);
+    v["comments"]["plan_days"] = json!("PRIVATE_TEXT");
+    v["instruments"]["EURUSD"]["plan_days"] = json!(17);
     let r = describe(&v);
-    assert_eq!(r["schema_version"], 2);
+    assert_eq!(r["strategy"], "swing");
     assert!(!r.to_string().contains("PRIVATE_TEXT"));
-    assert_eq!(r["disabled_modules"]["range_trading"], false);
     let fields = r["fields"].as_array().unwrap();
-    let p = fields
+    let parameter = fields
         .iter()
-        .find(|f| f["path"] == "/parameters/plan_days/value")
+        .find(|f| f["path"] == "/instruments/EURUSD/plan_days")
         .unwrap();
-    assert_eq!(p["value"], 17);
-    assert_eq!(p["telegram_editable"], true);
-    assert_eq!(p["constraints"]["minimum"], 1.0);
+    assert_eq!(parameter["value"], 17);
+    assert_eq!(parameter["telegram_editable"], true);
+    assert_eq!(parameter["constraints"]["minimum"], 1.0);
     fn leaves(v: &Value, path: String, out: &mut Vec<String>) {
         match v {
             Value::Object(m) => {
                 for (k, v) in m {
-                    if k != "comment" {
+                    if k != "comment" && k != "comments" {
                         leaves(v, format!("{path}/{k}"), out)
                     }
                 }
@@ -340,24 +299,22 @@ fn describe_covers_values_constraints_comments_and_disabled_modules_without_echo
     for path in paths {
         assert!(fields.iter().any(|f| f["path"] == path), "{path}");
     }
-    for f in fields {
-        assert!(v.pointer(f["path"].as_str().unwrap()).is_some());
-    }
     assert!(r["comment_paths"]
         .as_array()
         .unwrap()
-        .contains(&json!("/parameters/plan_days/comment")));
+        .contains(&json!("/comments/plan_days")));
+    let start = fields
+        .iter()
+        .find(|f| f["path"] == "/instruments/EURUSD/start")
+        .unwrap();
+    assert_eq!(start["telegram_editable"], false);
 }
 #[test]
-fn rule_order_does_not_change_calculation_configuration() {
+fn comment_edits_do_not_change_calculation_configuration() {
     let mut v = working();
     let before = forex_core::document::calculations(&v).unwrap();
-    for key in ["daily_rules", "weekly_rules"] {
-        v["policies"]["plans"][key]
-            .as_array_mut()
-            .unwrap()
-            .reverse();
-    }
+    v["comment"] = json!("Private explanation");
+    v["comments"]["plan_days"] = json!("500 bars — prose only");
     assert_eq!(forex_core::document::calculations(&v).unwrap(), before);
     describe(&v);
 }
@@ -367,7 +324,7 @@ fn describe_explicit_path_and_invalid_config() {
     fs::write(w.0.join("custom.json"), working().to_string()).unwrap();
     assert!(w.run(&["describe-config", "custom.json"]).status.success());
     let mut v = working();
-    v["schema_version"] = json!(99);
+    v["instruments"]["EURUSD"]["rr_fixed"] = json!(0);
     w.write(&v);
     let out = w.run(&["describe-config"]);
     assert_eq!(out.status.code(), Some(1));
