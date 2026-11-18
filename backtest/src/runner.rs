@@ -116,7 +116,7 @@ pub fn run(o: Options) -> Result<(), String> {
     let source_cfg = history::json_file(&o.data_config)?;
     let mut markets = Vec::new();
     let mut ledger = Ledger::default();
-    let mut minute_mode = false;
+    let mut intrabar_by_symbol = BTreeMap::new();
     let mut sources = BTreeMap::new();
     let mut initial = BTreeMap::new();
     let floor = o.from.div_euclid(60000) * 60000;
@@ -133,7 +133,7 @@ pub fn run(o: Options) -> Result<(), String> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut data = Dataset::open(roots, symbol, floor, o.to)?;
-        let (engine, agg, counts) = data.prepare(symbol, floor, &cfg)?;
+        let (engine, agg, counts, prepared_replay) = data.prepare(symbol, floor, &cfg)?;
         initial.insert(symbol.clone(), counts);
         for a in &data.archives {
             history::verify(&a.path, &a.sha256)?;
@@ -150,19 +150,23 @@ pub fn run(o: Options) -> Result<(), String> {
         let worker_gaps = data.gaps.clone();
         let worker_source = data.source.clone();
         let minutes = data.minute_mode;
-        minute_mode |= minutes;
-        let minute_files = if minutes {
-            data.prepared_files(symbol)?
-        } else {
-            Vec::new()
-        };
+        intrabar_by_symbol.insert(
+            symbol.clone(),
+            if minutes {
+                "synthetic"
+            } else {
+                "observed ticks"
+            },
+        );
+        let replay_context = if minutes { Some(prepared_replay) } else { None };
         let archives = data.archives;
         let symbol_worker = symbol.clone();
         let to = o.to;
         let (tx, rx) = sync_channel(1024);
         thread::spawn(move || {
             if minutes {
-                let result = history::read_minutes(&minute_files, floor, to, |m| {
+                let context = replay_context.expect("minute data has a prepared context");
+                let result = history::read_minutes_after_context(&context, floor, to, |m| {
                     tx.send(Ok(Feed::Minute(m)))
                         .map_err(|_| "consumer closed".to_owned())
                 });
@@ -346,7 +350,16 @@ pub fn run(o: Options) -> Result<(), String> {
         .enumerate()
         .map(|(i, s)| (s.clone(), markets[i].coverage.clone()))
         .collect();
-    let result = json!({"schema_version":1,"engine_version":env!("CARGO_PKG_VERSION"),"program_sha256":history::hash(&std::env::current_exe().map_err(|e|e.to_string())?)?,"strategy_sha256":format!("{:x}",Sha256::digest(&bytes)),"from":o.from,"to":o.to,"symbols":selected,"sample_seed":20261110,"initial_context":initial,"sources":sources,"coverage":coverage,"summary":ledger.summary(),"by_symbol":by_symbol,"monthly":monthly,"gap_affected_summary":stats(&affected),"trades":ledger.trades,"examples":chosen_examples,"execution":{"market":"first observed index price","limit":"level without improvement","stop":"observed index price","target":"level without improvement","costs":"not modeled","gaps":"observed ticks only; affected trades flagged","drawdown":"closed trades only","intrabar":if minute_mode {"synthetic: 4 index quotes per M1, worst-case extreme order for open signals"} else {"observed ticks"}}});
+    let distinct_modes: std::collections::BTreeSet<_> =
+        intrabar_by_symbol.values().copied().collect();
+    let aggregate_intrabar = if distinct_modes.len() > 1 {
+        "mixed"
+    } else if distinct_modes.contains("synthetic") {
+        "synthetic: 4 index quotes per M1, worst-case extreme order for open signals"
+    } else {
+        "observed ticks"
+    };
+    let result = json!({"schema_version":1,"engine_version":env!("CARGO_PKG_VERSION"),"program_sha256":history::hash(&std::env::current_exe().map_err(|e|e.to_string())?)?,"strategy_sha256":format!("{:x}",Sha256::digest(&bytes)),"from":o.from,"to":o.to,"symbols":selected,"sample_seed":20261110,"initial_context":initial,"sources":sources,"coverage":coverage,"summary":ledger.summary(),"by_symbol":by_symbol,"monthly":monthly,"gap_affected_summary":stats(&affected),"trades":ledger.trades,"examples":chosen_examples,"execution":{"market":"first observed index price","limit":"level without improvement","stop":"observed index price","target":"level without improvement","costs":"not modeled","gaps":"observed ticks only; affected trades flagged","drawdown":"closed trades only","intrabar":aggregate_intrabar,"intrabar_by_symbol":intrabar_by_symbol}});
     write_json(&o.output.join("results.json"), &result)?;
     let mut csv = csv::Writer::from_path(o.output.join("trades.csv")).map_err(|e| e.to_string())?;
     let fields = [

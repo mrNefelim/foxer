@@ -91,6 +91,77 @@ def _scenario(rows, start, end, pips):
     return result
 
 
+def _comparison_provenance(result, side):
+    symbols = result.get("symbols")
+    if (not isinstance(symbols, list) or not symbols or
+            any(not isinstance(s, str) or not s for s in symbols) or
+            len(set(symbols)) != len(symbols)):
+        raise ValueError(f"{side}: invalid symbol set")
+    sources = result.get("sources")
+    if not isinstance(sources, dict):
+        raise ValueError(f"{side}: missing source provenance")
+    normalized = {}
+    for symbol in sorted(symbols):
+        entry = sources.get(symbol)
+        files = entry.get("files") if isinstance(entry, dict) else None
+        if not isinstance(files, list) or not files:
+            raise ValueError(f"{side}: {symbol} missing source provenance")
+        labels, hashes = [], []
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError(f"{side}: {symbol} invalid source provenance")
+            label = item.get("source")
+            if label is not None:
+                if not isinstance(label, str) or not label.strip():
+                    raise ValueError(f"{side}: {symbol} invalid source identity")
+                labels.append(label)
+            for key in ("sha256", "quality_sha256", "manifest_sha256"):
+                value = item.get(key)
+                if value is not None:
+                    if not isinstance(value, str) or len(value) != 64:
+                        raise ValueError(f"{side}: {symbol} invalid {key}")
+                    try:
+                        int(value, 16)
+                    except ValueError as error:
+                        raise ValueError(f"{side}: {symbol} invalid hash ({key})") from error
+                    hashes.append(value.lower())
+        if not labels or not hashes:
+            raise ValueError(f"{side}: {symbol} missing source identity or content hashes")
+        normalized[symbol] = (tuple(sorted(labels)), tuple(sorted(hashes)))
+    execution = result.get("execution")
+    if not isinstance(execution, dict) or not execution:
+        raise ValueError(f"{side}: missing execution metadata")
+    aggregate = execution.get("intrabar")
+    synthetic = "synthetic: 4 index quotes per M1, worst-case extreme order for open signals"
+    known_aggregate = {"observed ticks": "observed ticks", synthetic: "synthetic"}
+    has_modes = "intrabar_by_symbol" in execution
+    modes = execution.get("intrabar_by_symbol")
+    if not has_modes:
+        if aggregate not in known_aggregate:
+            raise ValueError(f"{side}: execution mode cannot be normalized by symbol")
+        normalized_modes = {symbol: known_aggregate[aggregate] for symbol in symbols}
+    else:
+        if not isinstance(modes, dict) or set(modes) != set(symbols):
+            raise ValueError(f"{side}: execution mode map must cover the symbol set exactly")
+        if any(mode not in ("observed ticks", "synthetic") for mode in modes.values()):
+            raise ValueError(f"{side}: unknown per-symbol execution mode")
+        normalized_modes = dict(modes)
+        distinct = set(normalized_modes.values())
+        expected_aggregate = (
+            "mixed" if len(distinct) > 1 else
+            synthetic if distinct == {"synthetic"} else
+            "observed ticks"
+        )
+        if aggregate != expected_aggregate:
+            raise ValueError(f"{side}: execution mode conflicts with per-symbol map")
+    comparable_execution = {
+        key: value for key, value in execution.items()
+        if key not in ("intrabar", "intrabar_by_symbol")
+    }
+    comparable_execution["intrabar_by_symbol"] = normalized_modes
+    return tuple(sorted(symbols)), normalized, json.dumps(comparable_execution, sort_keys=True, separators=(",", ":"))
+
+
 def summarize(result):
     start, end = _number(result["from"]), _number(result["to"])
     _months(start, end)
@@ -158,6 +229,19 @@ def paired_bootstrap(baseline_monthly, candidate_monthly, block_months=3,
 def compare(baseline, candidate):
     if (baseline["from"], baseline["to"]) != (candidate["from"], candidate["to"]):
         raise ValueError("comparison requires identical from/to periods")
+    left_symbols = baseline.get("symbols")
+    right_symbols = candidate.get("symbols")
+    if (not isinstance(left_symbols, list) or not isinstance(right_symbols, list) or
+            sorted(left_symbols) != sorted(right_symbols)):
+        raise ValueError("comparison requires an identical symbol set")
+    left_meta = _comparison_provenance(baseline, "baseline")
+    right_meta = _comparison_provenance(candidate, "candidate")
+    if left_meta[0] != right_meta[0]:
+        raise ValueError("comparison requires an identical symbol set")
+    if left_meta[1] != right_meta[1]:
+        raise ValueError("comparison requires matching source provenance and content hashes")
+    if left_meta[2] != right_meta[2]:
+        raise ValueError("comparison requires matching execution metadata")
     left, right = summarize(baseline), summarize(candidate)
     names = ("gross", "stress_1pip", "stress_2pip")
     bootstrap = {name: paired_bootstrap(left[name]["monthly"], right[name]["monthly"]) for name in names}

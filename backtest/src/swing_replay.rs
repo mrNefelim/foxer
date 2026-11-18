@@ -24,13 +24,24 @@ pub fn parse_row(line: &str) -> Result<Minute, String> {
         .and_utc()
         .timestamp();
     let price = |s: &str| s.parse::<f64>().map_err(|_| "invalid MT5 price".to_owned());
-    Ok(Minute {
+    let minute = Minute {
         time,
         open: price(f[2])?,
         high: price(f[3])?,
         low: price(f[4])?,
         close: price(f[5])?,
-    })
+    };
+    let prices = [minute.open, minute.high, minute.low, minute.close];
+    if prices.iter().any(|p| !p.is_finite() || *p <= 0.0) {
+        return Err("MT5 prices must be finite and positive".into());
+    }
+    if minute.high < minute.open.max(minute.close)
+        || minute.low > minute.open.min(minute.close)
+        || minute.low > minute.high
+    {
+        return Err("invalid MT5 OHLC".into());
+    }
+    Ok(minute)
 }
 const HOUR4: i64 = 14_400;
 const DAY: i64 = 86_400;
@@ -124,12 +135,24 @@ pub fn build_dollar_index(pairs: &[Vec<Minute>]) -> Vec<Minute> {
 fn read_minutes(csv: &Path) -> Result<Vec<Minute>, String> {
     let file = std::fs::File::open(csv).map_err(|_| "cannot read MT5 export")?;
     let mut out = vec![];
+    let mut previous = None;
     for (n, line) in std::io::BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|_| "cannot read MT5 export")?;
         if n == 0 && line.starts_with('<') {
             continue;
         }
-        out.push(parse_row(line.trim_end()).map_err(|e| format!("line {}: {e}", n + 1))?);
+        let minute = parse_row(line.trim_end()).map_err(|e| format!("line {}: {e}", n + 1))?;
+        if previous.is_some_and(|time| time >= minute.time) {
+            return Err(format!(
+                "line {}: MT5 times must be strictly increasing",
+                n + 1
+            ));
+        }
+        previous = Some(minute.time);
+        out.push(minute);
+    }
+    if out.is_empty() {
+        return Err("MT5 history contains no quotes".into());
     }
     Ok(out)
 }
@@ -145,21 +168,28 @@ fn mt5_row(m: &Minute) -> String {
         m.close
     )
 }
+fn write_index(mut out: impl Write, index: &[Minute]) -> Result<(), String> {
+    for m in index {
+        writeln!(out, "{}", mt5_row(m)).map_err(|_| "cannot write output")?;
+    }
+    out.flush().map_err(|_| "cannot finish output".to_owned())
+}
 /// Writes the synthetic dollar index of six MT5 exports as an MT5-style export.
 pub fn build(inputs: &[&Path], output: &Path) -> Result<(), String> {
-    if output.exists() {
-        return Err("output already exists".into());
-    }
     let pairs = inputs
         .iter()
         .map(|p| read_minutes(p))
         .collect::<Result<Vec<_>, _>>()?;
     let index = build_dollar_index(&pairs);
-    let mut out =
-        std::io::BufWriter::new(std::fs::File::create(output).map_err(|_| "cannot create output")?);
-    for m in &index {
-        writeln!(out, "{}", mt5_row(m)).map_err(|_| "cannot write output")?;
+    if index.is_empty() {
+        return Err("input histories have no common timestamps".into());
     }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|_| "cannot create output exclusively")?;
+    write_index(std::io::BufWriter::new(file), &index)?;
     println!("{}", serde_json::json!({"minutes": index.len()}));
     Ok(())
 }
@@ -196,14 +226,15 @@ pub fn run(
     output: &Path,
     index: Option<(&Path, &Path)>,
 ) -> Result<(), String> {
-    if output.exists() {
-        return Err("output already exists".into());
+    let cfg = load_config(config)?;
+    if cfg.reference_exit.is_some() && index.is_none() {
+        return Err("reference_exit requires index history and index rules".into());
     }
     let events = match index {
         Some((csv, config)) => index_events(csv, config)?,
         None => vec![],
     };
-    let mut swing = Swing::new(load_config(config)?);
+    let mut swing = Swing::new(cfg);
     let mut bars = Bars::default();
     let mut known = 0;
     for m in read_minutes(csv)? {
@@ -220,7 +251,12 @@ pub fn run(
 }
 /// Writes the trade list and prints a summary.
 pub fn write_trades(swing: &Swing, output: &Path) -> Result<(), String> {
-    let mut out = std::fs::File::create(output).map_err(|_| "cannot create output")?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|_| "cannot create output exclusively")?;
+    let mut out = std::io::BufWriter::new(file);
     writeln!(
         out,
         "kind,dir,signal_t,fill_t,entry,stop,tp,rr,state,r,exit_t"
@@ -265,5 +301,35 @@ pub fn write_trades(swing: &Swing, output: &Path) -> Result<(), String> {
         "{}",
         serde_json::json!({"trades": swing.trades().len(), "closed": closed, "net_r": net, "bars": {"W": swing.frame(Tf::W).len(), "D": swing.frame(Tf::D).len(), "H4": swing.frame(Tf::H4).len()}})
     );
-    Ok(())
+    out.flush().map_err(|_| "cannot finish output".to_owned())
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    struct FlushFails;
+    impl Write for FlushFails {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected flush failure"))
+        }
+    }
+
+    #[test]
+    fn dxy_writer_reports_final_flush_failure() {
+        let index = [Minute {
+            time: 1_704_672_000,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+        }];
+        assert_eq!(
+            write_index(FlushFails, &index),
+            Err("cannot finish output".into())
+        );
+    }
 }

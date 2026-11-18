@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -19,11 +20,20 @@ def trade(symbol='EURUSD', side='Long', state='Active', entry=1000, stop=900,
                 stop=stop, entry_at=entry_at, exit_at=exit_at, result_r=result_r)
 
 
+def source_declaration(source='fixture', root='/fixture/root'):
+    return {'root': root, 'source': source, 'quality_sha256': 'a' * 64}
+
+
+def content_record(path='prepared/EURUSD-M1.csv'):
+    return {'prepared': path, 'sha256': 'b' * 64}
+
+
 def result(trades, symbols=None):
     symbols = symbols or ['EURUSD']
     return {'from': 0, 'to': 180000, 'symbols': symbols,
-            'sources': {symbol: {'files': [{'source': 'fixture'}],
-                        'excluded_intervals': []} for symbol in symbols},
+            'sources': {symbol: {'files': [
+                            source_declaration(), content_record(path=f'prepared/{symbol}-M1.csv')
+                        ], 'excluded_intervals': []} for symbol in symbols},
             'trades': trades, 'summary': {}}
 
 
@@ -67,7 +77,7 @@ class MarkToMarketTests(unittest.TestCase):
             self.assertEqual(coverage['missing_intervals_ms'],[[119000,179000]])
             self.assertEqual(path.read_bytes(),before)
 
-    def test_sqlite_requires_matching_unambiguous_result_provenance(self):
+    def test_sqlite_accepts_source_declaration_and_source_free_content_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'history.sqlite'
             db = sqlite3.connect(path)
@@ -78,42 +88,94 @@ class MarkToMarketTests(unittest.TestCase):
                                 'quotes': 1, 'gap_before_minutes': 0})))
             db.commit()
             db.close()
-
-            cases = []
-            missing = result([], ['EURUSD'])
-            del missing['sources']
-            cases.append(('missing source map', missing))
-            empty = result([], ['EURUSD'])
-            empty['sources']['EURUSD']['files'] = []
-            cases.append(('empty source list', empty))
-            mismatch = result([], ['EURUSD'])
-            mismatch['sources']['EURUSD']['files'][0]['source'] = 'fixture-b'
-            cases.append(('database mismatch', mismatch))
-            mixed = result([], ['EURUSD'])
-            mixed['sources']['EURUSD']['files'].append({'source': 'fixture-b'})
-            cases.append(('mixed result provenance', mixed))
-            for label, invalid in [
-                    ('empty object', {}),
-                    ('missing source', {'filename': 'other.csv'}),
-                    ('blank source', {'source': ''}),
-                    ('whitespace source', {'source': '  '}),
-                    ('non-object provenance', 'fixture-a')]:
-                malformed = result([], ['EURUSD'])
-                malformed['sources']['EURUSD']['files'][0]['source'] = 'fixture-a'
-                malformed['sources']['EURUSD']['files'].append(invalid)
-                cases.append((label, malformed))
-
-            for label, item in cases:
-                with self.subTest(label=label):
-                    with self.assertRaises(ValueError):
-                        mtm.load_common_quotes(path, item)
-
-            matching = result([], ['EURUSD'])
-            matching['sources']['EURUSD']['files'][0]['source'] = 'fixture-a'
-            matching['sources']['EURUSD']['files'].append({'source': 'fixture-a'})
-            times, prices, coverage = mtm.load_common_quotes(path, matching)
+            payload = result([], ['EURUSD'])
+            payload['sources']['EURUSD']['files'] = [
+                source_declaration('fixture-a', '/prepared/EURUSD'),
+                content_record('/prepared/EURUSD/prepared/EURUSD-M1-index-2026-01.csv'),
+            ]
+            before = path.read_bytes()
+            times, prices, coverage = mtm.load_common_quotes(path, payload)
             self.assertEqual(times.tolist(), [59000, 119000, 179000])
             self.assertEqual(coverage['by_symbol']['EURUSD']['source'], 'fixture-a')
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_sqlite_rejects_invalid_provenance_mutations_of_a_matching_control(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'history.sqlite'
+            db = sqlite3.connect(path)
+            db.executescript((MODULE.parents[1] / 'data/example.sql').read_text())
+            for ts in (0, 60, 120):
+                db.execute('INSERT INTO minutes VALUES(?,?,?,?)', ('EURUSD', 'fixture', ts,
+                    json.dumps({'timestamp': ts, 'price': [1000, 1001, 999, 1000],
+                                'quotes': 1, 'gap_before_minutes': 0})))
+            db.commit()
+            db.close()
+            valid = result([], ['EURUSD'])
+            before = path.read_bytes()
+            times, _prices, coverage = mtm.load_common_quotes(path, valid)
+            self.assertEqual(times.tolist(), [59000, 119000, 179000])
+            self.assertEqual(coverage['by_symbol']['EURUSD']['source'], 'fixture')
+            self.assertEqual(path.read_bytes(), before)
+
+            cases = []
+            missing_map = copy.deepcopy(valid)
+            del missing_map['sources']
+            cases.append(('missing source map', missing_map, 'missing result source provenance'))
+            empty = copy.deepcopy(valid)
+            empty['sources']['EURUSD']['files'] = []
+            cases.append(('empty source list', empty, 'missing result source provenance'))
+            mismatch = copy.deepcopy(valid)
+            mismatch['sources']['EURUSD']['files'][0]['source'] = 'fixture-b'
+            cases.append(('database mismatch', mismatch, 'result/database source mismatch'))
+            whitespace_collision = copy.deepcopy(valid)
+            whitespace_collision['sources']['EURUSD']['files'].append(
+                source_declaration(' fixture ', '/fixture/other-root'))
+            cases.append(('distinct whitespace-bearing declarations', whitespace_collision,
+                          'mixed result source provenance'))
+            malformed_records = [
+                ({}, 'invalid content provenance record'),
+                ({'root': '/fixture/root'}, 'invalid source declaration'),
+                ({'root': '/fixture/root', 'source': ''}, 'invalid source declaration'),
+                ({'root': '/fixture/root', 'source': '  '}, 'invalid source declaration'),
+                ({'prepared': '/fixture/file.csv'}, 'invalid content provenance record'),
+                ({'prepared': '', 'sha256': 'b' * 64}, 'invalid content provenance record'),
+                ({'prepared': '/fixture/file.csv', 'sha256': 'not-a-digest'},
+                 'invalid content provenance record'),
+                ({'prepared': '/fixture/file.csv', 'sha256': 'a' * 31 + '_' + 'a' * 32},
+                 'invalid content provenance record'),
+                ('fixture', 'invalid result provenance record'),
+            ]
+            for record, message in malformed_records:
+                mutated = copy.deepcopy(valid)
+                mutated['sources']['EURUSD']['files'].append(record)
+                cases.append((f'malformed record {record!r}', mutated, message))
+
+            for label, invalid, message in cases:
+                with self.subTest(label=label):
+                    with self.assertRaisesRegex(ValueError, message):
+                        mtm.load_common_quotes(path, invalid)
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_sqlite_preserves_whitespace_in_a_matching_source_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'history.sqlite'
+            source = ' fixture '
+            db = sqlite3.connect(path)
+            db.executescript((MODULE.parents[1] / 'data/example.sql').read_text())
+            for ts in (0, 60, 120):
+                db.execute('INSERT INTO minutes VALUES(?,?,?,?)', ("EURUSD", source, ts,
+                    json.dumps({'timestamp': ts, 'price': [1000, 1001, 999, 1000],
+                                'quotes': 1, 'gap_before_minutes': 0})))
+            db.commit()
+            db.close()
+            payload = result([], ['EURUSD'])
+            payload['sources']['EURUSD']['files'][0] = source_declaration(source)
+            before = path.read_bytes()
+            times, _prices, coverage = mtm.load_common_quotes(path, payload)
+            self.assertEqual(times.tolist(), [59000, 119000, 179000])
+            self.assertEqual(coverage['by_symbol']['EURUSD']['source'], source)
+            self.assertEqual(path.read_bytes(), before)
+
 
     def test_jpy_short_pip_scale_and_unfilled_time(self):
         tr=trade(symbol='USDJPY',side='Short',entry=150000000,stop=151000000,entry_at=60000)

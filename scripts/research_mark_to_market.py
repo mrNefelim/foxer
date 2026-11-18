@@ -14,6 +14,50 @@ import sqlite3
 import numpy as np
 
 PIP_TICKS = {'EURUSD': 100, 'GBPUSD': 100, 'USDJPY': 10000}
+CONTENT_PATH_KEYS = ('prepared', 'archive')
+DECLARATION_HASH_KEYS = ('quality_sha256', 'manifest_sha256')
+
+
+def _sha256(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in '0123456789abcdefABCDEF' for character in value)
+    )
+
+
+def _declared_result_source(provenance, symbol):
+    if not isinstance(provenance, list) or not provenance:
+        raise ValueError(f'{symbol}: missing result source provenance')
+    declared_sources = []
+    content_count = 0
+    for record in provenance:
+        if not isinstance(record, dict):
+            raise ValueError(f'{symbol}: invalid result provenance record')
+        if 'source' in record or 'root' in record:
+            root, source = record.get('root'), record.get('source')
+            if (not isinstance(root, str) or not root.strip() or
+                    not isinstance(source, str) or not source.strip() or
+                    any(key in record for key in CONTENT_PATH_KEYS)):
+                raise ValueError(f'{symbol}: invalid source declaration')
+            for key in DECLARATION_HASH_KEYS:
+                if key in record and not _sha256(record[key]):
+                    raise ValueError(f'{symbol}: invalid source declaration hash ({key})')
+            declared_sources.append(source)
+            continue
+        path_keys = [key for key in CONTENT_PATH_KEYS if key in record]
+        if len(path_keys) != 1:
+            raise ValueError(f'{symbol}: invalid content provenance record')
+        path = record[path_keys[0]]
+        if not isinstance(path, str) or not path.strip() or not _sha256(record.get('sha256')):
+            raise ValueError(f'{symbol}: invalid content provenance record')
+        content_count += 1
+    unique_sources = set(declared_sources)
+    if len(unique_sources) != 1:
+        raise ValueError(f'{symbol}: missing or mixed result source provenance')
+    if content_count == 0:
+        raise ValueError(f'{symbol}: missing result content provenance')
+    return next(iter(unique_sources))
 
 
 def load_common_quotes(database, result):
@@ -37,19 +81,8 @@ def load_common_quotes(database, result):
             source_map = result.get('sources')
             symbol_sources = source_map.get(symbol) if isinstance(source_map, dict) else None
             provenance = symbol_sources.get('files') if isinstance(symbol_sources, dict) else None
-            if not isinstance(provenance, list) or not provenance:
-                raise ValueError(f'{symbol}: missing result source provenance')
-            names = []
-            for record in provenance:
-                if not isinstance(record, dict):
-                    raise ValueError(f'{symbol}: invalid result source provenance record')
-                name = record.get('source')
-                if not isinstance(name, str) or not name.strip():
-                    raise ValueError(f'{symbol}: invalid result source provenance record')
-                names.append(name)
-            if len(set(names)) != 1:
-                raise ValueError(f'{symbol}: missing or mixed result source provenance')
-            if names[0] != source:
+            result_source = _declared_result_source(provenance, symbol)
+            if result_source != source:
                 raise ValueError(f'{symbol}: result/database source mismatch')
             # Restrict using indexed second timestamps; the quote is the observed
             # M1 close used by the existing synthetic path at minute start +59s.

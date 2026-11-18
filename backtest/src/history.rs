@@ -110,6 +110,12 @@ pub struct Dataset {
     pub archives: Vec<Archive>,
     pub provenance: Vec<Value>,
 }
+/// File list and prefix boundary checked by a successful context preparation.
+/// Fields are private so callers cannot mark an arbitrary manifest as prepared.
+pub struct PreparedReplayContext {
+    files: Vec<(PathBuf, Value)>,
+    prefix_boundary_ms: i64,
+}
 impl Dataset {
     pub fn open(roots: Vec<PathBuf>, symbol: &str, from: i64, to: i64) -> Result<Self, String> {
         let mut gaps = Vec::new();
@@ -232,7 +238,7 @@ impl Dataset {
         symbol: &str,
         from: i64,
         cfg: &Strategy,
-    ) -> Result<(Engine, Aggregator, Value), String> {
+    ) -> Result<(Engine, Aggregator, Value, PreparedReplayContext), String> {
         let cutoff = from / 1000;
         let files = self.prepared_files(symbol)?;
         let mut agg = Aggregator::default();
@@ -251,14 +257,14 @@ impl Dataset {
                 list.pop_front();
             }
         };
-        for (path, meta) in files {
+        for (path, meta) in &files {
             verify(
-                &path,
+                path,
                 meta["sha256"].as_str().ok_or("missing prepared hash")?,
             )?;
             self.provenance
                 .push(json!({"prepared":path,"sha256":meta["sha256"]}));
-            let mut reader = csv::Reader::from_path(&path).map_err(|e| e.to_string())?;
+            let mut reader = csv::Reader::from_path(path).map_err(|e| e.to_string())?;
             let headers = reader.headers().map_err(|e| e.to_string())?.clone();
             for row in reader.records() {
                 let row = row.map_err(|e| e.to_string())?;
@@ -308,7 +314,15 @@ impl Dataset {
                 engine.seed(tf, b, cfg)?;
             }
         }
-        Ok((engine, agg, json!(counts)))
+        Ok((
+            engine,
+            agg,
+            json!(counts),
+            PreparedReplayContext {
+                files,
+                prefix_boundary_ms: cutoff * 1000,
+            },
+        ))
     }
 }
 
@@ -354,6 +368,80 @@ pub fn read_minutes(
             }
             if ms >= from {
                 visit(m)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads the replay interval after `Dataset::prepare` has already fully checked
+/// and parsed the context prefix. Rechecks each file hash and timestamp order,
+/// while avoiding a second OHLC/UTC parse for rows before `from`.
+pub fn read_minutes_after_context(
+    context: &PreparedReplayContext,
+    from: i64,
+    to: i64,
+    visit: impl FnMut(prices::Minute) -> Result<(), String>,
+) -> Result<(), String> {
+    if context.prefix_boundary_ms != from {
+        return Err("replay start differs from the prepared context boundary".into());
+    }
+    if from >= to {
+        return Err("from must precede to".into());
+    }
+    read_minutes_after_context_inner(&context.files, from, to, visit)
+}
+
+fn read_minutes_after_context_inner(
+    files: &[(PathBuf, Value)],
+    from: i64,
+    to: i64,
+    mut visit: impl FnMut(prices::Minute) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut previous = None;
+    for (path, meta) in files {
+        verify(
+            path,
+            meta["sha256"].as_str().ok_or("missing prepared hash")?,
+        )?;
+        let mut reader = csv::Reader::from_path(path).map_err(|e| e.to_string())?;
+        let headers = reader.headers().map_err(|e| e.to_string())?.clone();
+        if headers.iter().ne([
+            "timestamp_utc",
+            "timestamp_ms",
+            "bar_end_utc",
+            "open",
+            "high",
+            "low",
+            "close",
+            "quote_count",
+            "gap_before_minutes",
+        ]) {
+            return Err("invalid index minute columns".into());
+        }
+        for row in reader.records() {
+            let row = row.map_err(|e| e.to_string())?;
+            if row.len() != 9 {
+                return Err("invalid index minute columns".into());
+            }
+            let millis: i64 = row[1].parse().map_err(|_| "invalid timestamp_ms")?;
+            let minute = if millis >= from || millis >= to {
+                Some(prices::parse_record(&headers, &row)?)
+            } else {
+                if millis.rem_euclid(60_000) != 0 {
+                    return Err("inconsistent minute timestamps".into());
+                }
+                None
+            };
+            if previous.is_some_and(|p| p >= millis) {
+                return Err("unordered or overlapping prepared minutes".into());
+            }
+            previous = Some(millis);
+            if millis >= to {
+                return Ok(());
+            }
+            if millis >= from {
+                visit(minute.expect("in-range rows are fully parsed"))?;
             }
         }
     }

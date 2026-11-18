@@ -65,6 +65,94 @@ def number(value, digits=2, suffix=''):
     return '-' if value is None else f'{value:,.{digits}f}'.replace(',', ' ') + suffix
 
 
+def execution_and_sources(data):
+    execution = data.get('execution')
+    if not isinstance(execution, dict) or not isinstance(execution.get('intrabar'), str):
+        method = 'Метод исполнения не указан в сохранённом результате.'
+        modes = {}
+    else:
+        intrabar = execution['intrabar']
+        symbols = data.get('symbols', [])
+        has_symbol_modes = 'intrabar_by_symbol' in execution
+        symbol_modes = execution.get('intrabar_by_symbol')
+        if not has_symbol_modes:
+            if intrabar == 'observed ticks':
+                symbol_modes = {symbol: 'observed ticks' for symbol in symbols}
+            elif intrabar == 'synthetic: 4 index quotes per M1, worst-case extreme order for open signals':
+                symbol_modes = {symbol: 'synthetic' for symbol in symbols}
+            else:
+                symbol_modes = {}
+        valid_modes = (
+            isinstance(symbol_modes, dict)
+            and set(symbol_modes) == set(symbols)
+            and all(mode in ('observed ticks', 'synthetic') for mode in symbol_modes.values())
+        )
+        if valid_modes:
+            modes = {
+                symbol: (
+                    'только наблюдаемые тики; внутриминутный путь не восстанавливается'
+                    if mode == 'observed ticks' else
+                    'четыре синтетические индексные котировки на минуту; экстремумы идут в неблагоприятном порядке для открытых сигналов'
+                )
+                for symbol, mode in symbol_modes.items()
+            }
+            distinct = set(symbol_modes.values())
+            expected = ('mixed' if len(distinct) > 1 else
+                        'synthetic: 4 index quotes per M1, worst-case extreme order for open signals'
+                        if distinct == {'synthetic'} else 'observed ticks')
+            if intrabar != expected:
+                method = 'Режим исполнения противоречит сохранённой карте пар.'
+            elif intrabar == 'mixed':
+                method = 'В запуске использованы разные модели исполнения; режим указан для каждой пары ниже.'
+            elif intrabar == 'synthetic: 4 index quotes per M1, worst-case extreme order for open signals':
+                method = 'Модель пути цены: четыре синтетические индексные котировки на минуту; при открытых сигналах экстремумы идут в неблагоприятном порядке.'
+            else:
+                method = 'Модель пути цены: только наблюдаемые тики; внутриминутный путь не восстанавливается.'
+        else:
+            modes = {}
+            if intrabar == 'mixed' or 'intrabar_by_symbol' in execution:
+                method = 'Режим исполнения по парам отсутствует, неполон или противоречив; точное описание невозможно.'
+            elif intrabar == 'synthetic: 4 index quotes per M1, worst-case extreme order for open signals':
+                method = 'Модель пути цены: четыре синтетические индексные котировки на минуту; при открытых сигналах экстремумы идут в неблагоприятном порядке.'
+            elif intrabar == 'observed ticks':
+                method = 'Модель пути цены: только наблюдаемые тики; внутриминутный путь не восстанавливается.'
+            else:
+                method = f'Режим исполнения сохранён, но не распознан: {intrabar}.'
+    labels = set()
+    sources = data.get('sources')
+    if isinstance(sources, dict):
+        for entry in sources.values():
+            files = entry.get('files') if isinstance(entry, dict) else None
+            if not isinstance(files, list):
+                continue
+            for record in files:
+                label = record.get('source') if isinstance(record, dict) else None
+                if isinstance(label, str) and label.strip():
+                    labels.add(label.strip())
+    source_text = ('Источники: ' + '; '.join(sorted(labels)) + '.') if labels else 'Источник котировок не указан в сохранённом результате.'
+    return execution if isinstance(execution, dict) else {}, method, source_text, modes
+
+
+def execution_value(key, value):
+    known = {
+        ('market', 'first observed index price'): 'первая допустимая наблюдаемая цена индекса',
+        ('limit', 'level without improvement'): 'уровень без улучшения цены',
+        ('stop', 'observed index price'): 'наблюдаемая цена индекса на стороне выхода',
+        ('target', 'level without improvement'): 'уровень без улучшения цены',
+        ('costs', 'not modeled'): 'не моделируются',
+        ('gaps', 'observed ticks only; affected trades flagged'): 'используются доступные котировки; сделки, затронутые пропусками, отмечаются',
+        ('drawdown', 'closed trades only'): 'по закрытым сделкам',
+    }
+    if key == 'intrabar':
+        if value == 'mixed':
+            return 'смешанный режим; см. режимы по каждой паре'
+        if value == 'observed ticks':
+            return 'только наблюдаемые тики'
+        if value == 'synthetic: 4 index quotes per M1, worst-case extreme order for open signals':
+            return 'четыре синтетические индексные котировки на минуту; неблагоприятный порядок экстремумов для открытых сигналов'
+    return known.get((key, value), f'неизвестное значение ({value})')
+
+
 def figure_image(fig, width=WIDTH, height=270):
     stream = io.BytesIO()
     fig.savefig(stream, format='png', dpi=180, facecolor='white', bbox_inches='tight')
@@ -161,6 +249,7 @@ def render(directory):
         tab.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor(NAVY)),('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),8),('RIGHTPADDING',(0,0),(-1,-1),8),('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6),('LINEBELOW',(0,0),(-1,0),.7,colors.HexColor(TEAL)),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#F7F9FB')])]))
         story.extend([tab, Spacer(1,8)])
     s = data['summary']
+    execution, execution_label, source_label, execution_modes = execution_and_sources(data)
     story.append(paragraph('ОТЧЁТ ОБ ИСТОРИЧЕСКОМ ТЕСТИРОВАНИИ', 'SmallRu'))
     story.append(paragraph('Стратегия в цифрах', 'TitleRu'))
     story.append(paragraph(f"{timestamp(data['from'])} - {timestamp(data['to'])} UTC · конец периода не включён"))
@@ -170,7 +259,9 @@ def render(directory):
     story.append(equity_chart(s, data['from'], data['to']))
     if not s['closed']:
         story.append(paragraph('Сделки не закрывались. Нулевая выборка не характеризует качество стратегии.'))
-    story.append(paragraph('Результат по наблюдаемым котировкам. Издержки не моделируются. Просадка рассчитана по закрытым сделкам, не по стоимости открытых позиций.', 'SmallRu'))
+    costs = execution_value('costs', execution['costs']) if 'costs' in execution else 'сведения не сохранены'
+    drawdown = execution_value('drawdown', execution['drawdown']) if 'drawdown' in execution else 'сведения не сохранены'
+    story.append(paragraph(f"{execution_label} Издержки: {costs}. Просадка: {drawdown}.", 'SmallRu'))
     heading('Результаты по парам')
     rows = [['Пара','Закрыто','Итог, R','Просадка, R','Среднее, R']]
     for symbol, row in data['by_symbol'].items():
@@ -191,7 +282,15 @@ def render(directory):
             rows.append([trade['symbol']+' / '+('открыт' if trade['state']=='Active' else 'ожидание'),number(trade['entry']/1e6,6),number(trade.get('unrealized_r')),timestamp(trade.get('marked_at'))])
     table(rows,[120,100,85,170])
     heading('Покрытие котировок')
-    story.append(paragraph('Известные исключённые интервалы не заполнялись. Длинная пауза между тиками сама по себе не считается доказанным сбоем. Порядок событий берётся из доступных тиков; неизвестный путь цены не восстанавливается.', 'SmallRu'))
+    story.append(paragraph(source_label, 'SmallRu'))
+    if execution_modes:
+        mode_lines = [f"{symbol} — {mode}" for symbol, mode in sorted(execution_modes.items())]
+        story.append(paragraph('Режим исполнения по парам: ' + '; '.join(mode_lines) + '.', 'SmallRu'))
+    if execution.get('intrabar'):
+        gap_rule = execution_value('gaps', execution['gaps']) if 'gaps' in execution else 'сведения не сохранены'
+        story.append(paragraph(f"Путь цены: {execution_value('intrabar', execution['intrabar'])}. Правило гэпов: {gap_rule}.", 'SmallRu'))
+    else:
+        story.append(paragraph('Методика обработки внутриминутных цен и гэпов не указана в сохранённом результате.', 'SmallRu'))
     rows = [['Пара','Тиков','Первая / последняя котировка UTC']]
     for symbol, row in data['coverage'].items():
         rows.append([symbol,str(row['ticks']),timestamp(row['first'])+' / '+timestamp(row['last'])])
@@ -206,15 +305,21 @@ def render(directory):
     story.append(paragraph('SHA-256 правил: '+data['strategy_sha256'], 'SmallRu'))
     story.append(paragraph('Версия: '+data['engine_version']+'. Полные хеши архивов, manifests и подготовленных файлов сохранены в results.json; применённые правила - в strategy.json.', 'SmallRu'))
     heading('Методика исполнения')
-    for text in [
-        'Рыночный вход - первая допустимая котировка. Вход и выход используют одну индексную цену.',
-        'Лимитный вход и тейк исполняются по уровню, без улучшения цены. Стоп - по первой наблюдаемой цене стороны выхода; перескок может дать убыток больше 1R.',
-        'R фиксируется расстоянием от цены входа до исходного стопа. Дополнительные задержки и проскальзывание не моделируются.',
-        'В начале периода нет позиций и ожидающих планов. Предыдущие свечи используются только для текущих зон, фракталов и направления.',
-        'Три лучших, три худших и три случайных примера выбираются без повторов. Зерно выборки фиксировано; при малой выборке показываются доступные сделки.',
-        'Происхождение исторических котировок указывается в отчёте. Совпадение с котировками сервера или брокерским исполнением не утверждается.'
-    ]:
-        story.append(paragraph(text, 'SmallRu'))
+    labels = {
+        'market': 'Рыночное исполнение', 'limit': 'Лимитное исполнение',
+        'stop': 'Исполнение стопа', 'target': 'Исполнение цели',
+        'costs': 'Издержки', 'gaps': 'Обработка пропусков',
+        'drawdown': 'Метод просадки', 'intrabar': 'Внутриминутная модель',
+    }
+    if execution:
+        for key, label in labels.items():
+            if key in execution:
+                story.append(paragraph(f"{label}: {execution_value(key, execution[key])}.", 'SmallRu'))
+        story.append(paragraph(source_label, 'SmallRu'))
+    else:
+        story.append(paragraph('Подробная методика исполнения и источник котировок не сохранены; восстановить их по сделкам нельзя.', 'SmallRu'))
+    story.append(paragraph('Три лучших, три худших и три случайных примера выбираются без повторов. Зерно выборки фиксировано; при малой выборке показываются доступные сделки.', 'SmallRu'))
+    story.append(paragraph('Совпадение исторического результата с котировками сервера или брокерским исполнением не утверждается.', 'SmallRu'))
     for index, example in enumerate(data['examples'],1):
         story.append(PageBreak())
         trade=example['trade'];plan=trade.get('basis',{}).get('plan') or {}
